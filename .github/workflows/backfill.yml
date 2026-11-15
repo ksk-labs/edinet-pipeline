@@ -4,8 +4,10 @@ name: backfill
 # 索引と日別 tar を取得し、pipeline.cli で Silver へ変換して、状態と
 # 結合結果を v2 データセットへ格納する。
 # - 月ごとに fetch (v2 から状態を復元) -> 日次変換 -> 月次結合 -> push。
-# - 日次変換のたびに目録だけを先に push するため、ジョブが途中で
-#   終わっても前進は残り、再実行は目録と目録駆動の再開で続きから進む。
+# - 目録だけの push は5日ごとに行う。2026-11-15 の並行実行で
+#   毎日の push (約19分で約115コミット) の直後に両ジョブが失敗し、
+#   再実行では書き込みが長時間進まなかったため、HF 側の書き込み
+#   レート制限を疑い、コミット頻度を大きく下げた (月あたり約5回)。
 # - 索引はリビジョン固定で取得し、SHA-256 を照合してから使う
 #   (母数の確定のため)。
 on:
@@ -56,7 +58,9 @@ jobs:
               --state-dir "$state" --out-dir "$out"
             days=$(python -m pipeline.hf_sync days \
               --month "$month" --index work/index.parquet)
+            day_count=0
             for d in $days; do
+              day_count=$((day_count + 1))
               y="${d:0:4}"; m="${d:5:2}"; dd="${d:8:2}"
               curl -fL --retry 5 --retry-all-errors --retry-delay 5 -o "work/tars/$d.tar" \
                 "$V1_BASE/raw/edinet/$y/$m/$dd.tar"
@@ -67,12 +71,14 @@ jobs:
               if [ -n "$MAX_DOCS" ]; then args+=(--max-docs "$MAX_DOCS"); fi
               python -m pipeline.cli "${args[@]}"
               rm -f "work/tars/$d.tar"
-              # 目録の push は前進記録であり、失敗しても変換は続ける
-              # (状態の確定は月末の push が担う。再実行時は目録と
-              # シャードの自己回復で続きから進む)。
-              python -m pipeline.hf_sync push-ledger --month "$month" \
-                --state-dir "$state" \
-                || echo "::warning::push-ledger failed for $month $d; continuing"
+              # 目録の push は5日ごとの前進記録であり、失敗しても
+              # 変換は続ける (状態の確定は月末の push が担う。
+              # 再実行時は目録とシャードの自己回復で続きから進む)。
+              if [ $((day_count % 5)) -eq 0 ]; then
+                python -m pipeline.hf_sync push-ledger --month "$month" \
+                  --state-dir "$state" \
+                  || echo "::warning::push-ledger failed for $month $d; continuing"
+              fi
             done
             python -m pipeline.cli --index work/index.parquet \
               --since "$month-01" --until "$month-31" \
