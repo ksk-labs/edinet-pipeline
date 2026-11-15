@@ -1,0 +1,97 @@
+name: convert
+
+# Silver 変換バッチ (python -m pipeline.cli) を GitHub Actions で回す。
+# - push: 依存の導入と CLI の起動だけを確認する軽い smoke ジョブ。
+# - workflow_dispatch: 指定した提出日の tar を HF (v1、読み取り専用) から
+#   取得し、索引からジョブを作って変換する。処理済みは目録 (ledger.jsonl)
+#   で管理され、成果物は artifact に残る。状態 (state) を引き継いで再実行
+#   すれば、処理済みの書類は自動で飛ばされる (冪等・再開可能)。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "対象の提出日 (YYYY-MM-DD、カンマ区切りで複数可)"
+        required: true
+        type: string
+      doc_types:
+        description: "対象の doc_type (カンマ区切り、空なら全て)"
+        required: false
+        type: string
+        default: ""
+      max_docs:
+        description: "今回の実行で試行する書類数の上限 (空なら無制限)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  smoke:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Import and CLI help
+        run: |
+          python -c "import pipeline.convert_core, pipeline.batch"
+          python -m pipeline.cli --help
+
+  convert:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download index and day tars from HF v1 (read-only)
+        env:
+          DATES: ${{ inputs.dates }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/tars work/state work/out
+          base="https://huggingface.co/datasets/Yoshi-Dai/financial-lakehouse/resolve/main"
+          curl -fL --retry 3 -o work/index.parquet \
+            "$base/catalog/documents_index.parquet"
+          IFS=',' read -ra days <<< "$DATES"
+          for d in "${days[@]}"; do
+            y="${d:0:4}"; m="${d:5:2}"; dd="${d:8:2}"
+            curl -fL --retry 3 -o "work/tars/$d.tar" \
+              "$base/raw/edinet/$y/$m/$dd.tar"
+          done
+      - name: Run batch per date (ledger carries progress)
+        env:
+          DATES: ${{ inputs.dates }}
+          DOC_TYPES: ${{ inputs.doc_types }}
+          MAX_DOCS: ${{ inputs.max_docs }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra days <<< "$DATES"
+          for d in "${days[@]}"; do
+            args=(--index work/index.parquet
+                  --since "$d" --until "$d"
+                  --tars-dir work/tars
+                  --state-dir work/state
+                  --out-dir work/out)
+            if [ -n "$DOC_TYPES" ]; then args+=(--doc-types "$DOC_TYPES"); fi
+            if [ -n "$MAX_DOCS" ]; then args+=(--max-docs "$MAX_DOCS"); fi
+            python -m pipeline.cli "${args[@]}"
+          done
+      - name: Upload state and output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: silver-${{ inputs.dates }}
+          path: |
+            work/state
+            work/out
+          if-no-files-found: warn
