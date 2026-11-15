@@ -1,14 +1,14 @@
-# 実行ログ（T3 変換、Step 2 塊1 修正後）
+# 実行ログ（T3 変換、Step 2 塊1 修正・重複除去修正後）
 
 - 処理した書類: 29/29
-- Silver の行数: 21189
-- parquet の SHA-256: a0bef894c7c13ab5fe7497f837f255a1544d5cb421f0b1d7185acbbc4819e8e9
+- Silver の行数: 21079
+- parquet の SHA-256: b6fc90b354c0b5a9866f5b183db97778994035babc6e4872eba6ac08702a2559
 - 欠落した書類: なし
 - 統計: {'numeric': 44388, 'non_numeric': 15828, 'nil': 6040, 'unparseable': 0, 'no_context': 0}
 - 統計 (由来別): {'xbrl': {'numeric': 22194, 'non_numeric': 7914, 'nil': 3020, 'unparseable': 0, 'no_context': 0}, 'ixbrl': {'numeric': 22194, 'non_numeric': 7914, 'nil': 3020, 'unparseable': 0, 'no_context': 0}}
 - 対象外の内訳: {'non_numeric': 15828, 'nil': 6040, 'unparseable': 0, 'no_context': 0}
-- dimension が空でない行数: 14476
-- ixbrl 由来で新たに加わった行数: 110
+- dimension が空でない行数: 14381
+- ixbrl 由来で新たに加わった行数: 0
 
 ## 要素名の正規化規則 (Step 2 塊1 (d))
 
@@ -18,16 +18,18 @@
 
 | 項目 | 修正前 | 修正後 |
 |---|---|---|
-| Silver の行数 | 22194 | 21189 |
-| unparseable 件数 (全体) | 2710 | 0 |
-| unparseable 件数 (.xbrl 由来のみ) | 2710 | 0 |
-| nil 件数 (全体) | 0 | 6040 |
-| nil 件数 (.xbrl 由来のみ) | 0 | 3020 |
-| dimension が空でない行数 | 0 | 14476 |
-| ixbrl 由来で新たに加わった行数 | 0 | 110 |
-| parquet の SHA-256 | 85ba807b04239c55dbde7da18eec5c62f1331eb84a0083fef246c7f57a6ffe1a | a0bef894c7c13ab5fe7497f837f255a1544d5cb421f0b1d7185acbbc4819e8e9 |
+| Silver の行数 | 21189 | 21079 |
+| unparseable 件数 (全体) | 0 | 0 |
+| unparseable 件数 (.xbrl 由来のみ) | 0 | 0 |
+| nil 件数 (全体) | 6040 | 6040 |
+| nil 件数 (.xbrl 由来のみ) | 6040 | 3020 |
+| dimension が空でない行数 | 14476 | 14381 |
+| ixbrl 由来で新たに加わった行数 | 0 | 0 |
+| parquet の SHA-256 | a0bef894c7c13ab5fe7497f837f255a1544d5cb421f0b1d7185acbbc4819e8e9 | b6fc90b354c0b5a9866f5b183db97778994035babc6e4872eba6ac08702a2559 |
 
-注: 修正前の統計は .xbrl からの抽出のみ (Inline XBRL の寄与 0 件)。修正後の全体統計は .xbrl と Inline XBRL の両方の抽出を含むため、nil と unparseable は .xbrl 由来のみの行でも併記する。
+重複除去の数値キー化 (修正 (e)) により、修正前 21189 行から 110 件の重複行が落ち、修正後は 21079 行になった。
+
+注: 修正前は、上書き前に読み取った前回の実行結果 (run_log.json と parquet) の値。nil と unparseable は全体と .xbrl 由来のみを併記する。
 
 ## tar のハッシュ（取得元）
 
@@ -49,8 +51,8 @@
 
 ## 書類ごとの結果
 
-- S100ZH4D (JG-L): ok facts=686 extracted=1404 ixbrl_new=5
-- S100ZCDP (JG-L): ok facts=825 extracted=1700 ixbrl_new=8
+- S100ZH4D (JG-L): ok facts=681 extracted=1404 ixbrl_new=0
+- S100ZCDP (JG-L): ok facts=817 extracted=1700 ixbrl_new=0
 - S100ZBQZ (JG-L): ok facts=1069 extracted=2238 ixbrl_new=0
 - S100ZAWS (JG-L): ok facts=650 extracted=1356 ixbrl_new=0
 - S100ZABE (JG-L): ok facts=856 extracted=1778 ixbrl_new=0
@@ -63,18 +65,18 @@
 - S100Z6ZN (JG-U): ok facts=67 extracted=140 ixbrl_new=0
 - S100ZA5J (IF-L): ok facts=871 extracted=1876 ixbrl_new=0
 - S100Z5CA (IF-L): ok facts=1277 extracted=2692 ixbrl_new=0
-- S100Z5AL (IF-L): ok facts=1188 extracted=2508 ixbrl_new=13
+- S100Z5AL (IF-L): ok facts=1175 extracted=2508 ixbrl_new=0
 - S100Z4CX (IF-L): ok facts=1061 extracted=2282 ixbrl_new=0
 - S100Z4H9 (IF-L): ok facts=738 extracted=1594 ixbrl_new=0
 - S100YH1E (IF-U): ok facts=837 extracted=1812 ixbrl_new=0
 - S100YN5G (IF-U): ok facts=1128 extracted=2436 ixbrl_new=0
 - S100YIBH (US-L): ok facts=816 extracted=1678 ixbrl_new=0
-- S100YC5C (US-L): ok facts=941 extracted=1906 ixbrl_new=8
-- S100YG81 (US-L): ok facts=773 extracted=1588 ixbrl_new=1
-- S100YG5L (US-L): ok facts=909 extracted=1852 ixbrl_new=1
-- S100X8TY (AMEND-120): ok facts=1135 extracted=2384 ixbrl_new=21
-- S100XD4M (AMEND-130): ok facts=1135 extracted=2384 ixbrl_new=21
+- S100YC5C (US-L): ok facts=933 extracted=1906 ixbrl_new=0
+- S100YG81 (US-L): ok facts=772 extracted=1588 ixbrl_new=0
+- S100YG5L (US-L): ok facts=908 extracted=1852 ixbrl_new=0
+- S100X8TY (AMEND-120): ok facts=1114 extracted=2384 ixbrl_new=0
+- S100XD4M (AMEND-130): ok facts=1114 extracted=2384 ixbrl_new=0
 - S100XD30 (AMEND-120): ok facts=571 extracted=1198 ixbrl_new=0
 - S100ZEHZ (AMEND-130): ok facts=571 extracted=1198 ixbrl_new=0
-- S100XCU9 (AMEND-120): ok facts=1105 extracted=2280 ixbrl_new=16
-- S100XZ2X (AMEND-130): ok facts=1105 extracted=2280 ixbrl_new=16
+- S100XCU9 (AMEND-120): ok facts=1089 extracted=2280 ixbrl_new=0
+- S100XZ2X (AMEND-130): ok facts=1089 extracted=2280 ixbrl_new=0
