@@ -36,7 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work/tars
-          curl -fL --retry 3 -o work/index.parquet \
+          curl -fL --retry 5 --retry-all-errors --retry-delay 5 -o work/index.parquet \
             "https://huggingface.co/datasets/Yoshi-Dai/financial-lakehouse/resolve/43540407ea82f792551e145598b1cf50cde6cb78/catalog/documents_index.parquet"
           echo "68a8c01ea8cc1c952eeeb4b3b1eebf2dd52a3b56b511c45a8f9154b601512997  work/index.parquet" | sha256sum -c -
       - name: Run months
@@ -58,7 +58,7 @@ jobs:
               --month "$month" --index work/index.parquet)
             for d in $days; do
               y="${d:0:4}"; m="${d:5:2}"; dd="${d:8:2}"
-              curl -fL --retry 3 -o "work/tars/$d.tar" \
+              curl -fL --retry 5 --retry-all-errors --retry-delay 5 -o "work/tars/$d.tar" \
                 "$V1_BASE/raw/edinet/$y/$m/$dd.tar"
               args=(--index work/index.parquet
                     --since "$d" --until "$d"
@@ -67,8 +67,12 @@ jobs:
               if [ -n "$MAX_DOCS" ]; then args+=(--max-docs "$MAX_DOCS"); fi
               python -m pipeline.cli "${args[@]}"
               rm -f "work/tars/$d.tar"
+              # 目録の push は前進記録であり、失敗しても変換は続ける
+              # (状態の確定は月末の push が担う。再実行時は目録と
+              # シャードの自己回復で続きから進む)。
               python -m pipeline.hf_sync push-ledger --month "$month" \
-                --state-dir "$state"
+                --state-dir "$state" \
+                || echo "::warning::push-ledger failed for $month $d; continuing"
             done
             python -m pipeline.cli --index work/index.parquet \
               --since "$month-01" --until "$month-31" \

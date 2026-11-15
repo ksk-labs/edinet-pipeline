@@ -27,6 +27,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -40,6 +41,33 @@ FILES = ("ledger.jsonl", "silver.parquet", "run_summary.json")
 
 def _prefix(month):
     return f"silver/month={month}"
+
+
+def _retryable(exc):
+    """一時的な失敗 (429 / 5xx / 接続エラー) だけを再試行対象にする。"""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is not None:
+        return status == 429 or status >= 500
+    return isinstance(exc, OSError)
+
+
+def _with_retry(what, fn):
+    """HF API 呼び出しを指数バックオフで再試行する。
+
+    2026-11-15 の G1/G2 並行実行では、両ジョブが同じ分に相次いで
+    失敗した (最後の成功コミットの直後)。原因はログ経路の制約で
+    特定できていないが、一時的な HF 側の失敗への耐性をここに入れる。
+    """
+    delays = (5, 15, 30, 60, 120)
+    for attempt in range(len(delays) + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == len(delays) or not _retryable(exc):
+                raise
+            print(f"{what}: retry {attempt + 1} after error: {exc!r}",
+                  file=sys.stderr)
+            time.sleep(delays[attempt])
 
 
 def _split_shards(combined_path, silver_dir):
@@ -67,13 +95,16 @@ def fetch(repo, month, state_dir, out_dir):
     """v2 からその月の状態を復元する。未着手の月は fresh を返す。"""
     prefix = _prefix(month)
     api = HfApi()
-    files = [f for f in api.list_repo_files(repo, repo_type="dataset")
-             if f.startswith(prefix + "/")]
+    files = [f for f in _with_retry(
+        "list_repo_files",
+        lambda: api.list_repo_files(repo, repo_type="dataset"))
+        if f.startswith(prefix + "/")]
     if f"{prefix}/ledger.jsonl" not in files:
         return {"month": month, "status": "fresh"}
     with tempfile.TemporaryDirectory() as tmp:
-        snapshot_download(repo_id=repo, repo_type="dataset",
-                          allow_patterns=[prefix + "/*"], local_dir=tmp)
+        _with_retry("snapshot_download", lambda: snapshot_download(
+            repo_id=repo, repo_type="dataset",
+            allow_patterns=[prefix + "/*"], local_dir=tmp))
         src = os.path.join(tmp, prefix)
         os.makedirs(state_dir, exist_ok=True)
         os.makedirs(out_dir, exist_ok=True)
@@ -107,10 +138,10 @@ def push(repo, month, state_dir, out_dir):
             src = os.path.join(out_dir, name)
             if os.path.exists(src):
                 shutil.copyfile(src, os.path.join(stage, name))
-        result = api.upload_folder(
+        result = _with_retry("upload_folder", lambda: api.upload_folder(
             folder_path=stage, repo_id=repo, repo_type="dataset",
             path_in_repo=prefix,
-            commit_message=f"backfill {month}: ledger and combined silver")
+            commit_message=f"backfill {month}: ledger and combined silver"))
     return {"month": month, "status": "pushed",
             "commit_url": getattr(result, "commit_url", None)}
 
@@ -119,11 +150,11 @@ def push_ledger(repo, month, state_dir):
     """目録だけを v2 へ上げる (日次の前進記録)。"""
     prefix = _prefix(month)
     api = HfApi()
-    result = api.upload_file(
+    result = _with_retry("upload_file", lambda: api.upload_file(
         path_or_fileobj=os.path.join(state_dir, "ledger.jsonl"),
         path_in_repo=f"{prefix}/ledger.jsonl",
         repo_id=repo, repo_type="dataset",
-        commit_message=f"backfill {month}: ledger progress")
+        commit_message=f"backfill {month}: ledger progress"))
     return {"month": month, "status": "ledger_pushed",
             "commit_url": getattr(result, "commit_url", None)}
 
