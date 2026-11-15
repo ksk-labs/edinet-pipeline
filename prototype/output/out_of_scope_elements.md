@@ -1,0 +1,76 @@
+# 対象外要素の分類報告（T3）
+
+## non_numeric: 8224件
+
+- NameMajorShareholders: 219件
+- AddressMajorShareholders: 219件
+- OfficialTitleOrPositionInformationAboutDirectorsAndCorporateAuditors: 210件
+- NameInformationAboutDirectorsAndCorporateAuditors: 210件
+- DateOfBirthInformationAboutDirectorsAndCorporateAuditors: 210件
+- CareerSummaryInformationAboutDirectorsAndCorporateAuditorsTextBlock: 210件
+- TermOfOfficeInformationAboutDirectorsAndCorporateAuditors: 210件
+- NameOfSecuritiesDetailsOfSpecifiedInvestmentEquitySecuritiesHeldForPurposesOtherThanPureInvestmentReportingCompany: 150件
+- PurposeOfShareholdingOverviewOfBusinessAllianceQuantitativeEffectsOfShareholdingAndReasonForIncreaseInNumberOfSharesDetailsOfSpecifiedInvestmentSharesHeldForPurposesOtherThanPureInvestmentReportingCompany: 150件
+- WhetherIssuerOfAforementionedSharesHoldsReportingCompanysSharesDetailsOfSpecifiedInvestmentSharesHeldForPurposesOtherThanPureInvestmentReportingCompany: 150件
+- DescriptionIssuedSharesVotingRights: 127件
+- MetricsDescriptionOfMetricsRelatedToPolicyOnDevelopmentOfHumanResourcesAndInternalEnvironmentAndTargetsAndPerformanceUsingSuchMetrics: 108件
+- FootnotesDirectorsAndCorporateAuditorsTextBlock: 105件
+- MetricsUnitDescriptionOfMetricsRelatedToPolicyOnDevelopmentOfHumanResourcesAndInternalEnvironmentAndTargetsAndPerformanceUsingSuchMetrics: 77件
+- ConsolidatedSubsidiariesMetricsOfConsolidatedSubsidiaries: 70件
+- OfficialTitleOrPositionInformationAboutDirectorsAndCorporateAuditorsProposal: 58件
+- NameInformationAboutDirectorsAndCorporateAuditorsProposal: 58件
+- DateOfBirthInformationAboutDirectorsAndCorporateAuditorsProposal: 58件
+- CareerSummaryInformationAboutDirectorsAndCorporateAuditorsProposalTextBlock: 58件
+- TermOfOfficeInformationAboutDirectorsAndCorporateAuditorsProposal: 58件
+- OfficialTitleOrPositionInformationAboutExecutiveDirectors: 38件
+- NameInformationAboutExecutiveDirectors: 38件
+- DateOfBirthInformationAboutExecutiveDirectors: 38件
+- CareerSummaryInformationAboutExecutiveDirectorsTextBlock: 38件
+- TermOfOfficeInformationAboutExecutiveDirectors: 38件
+- SecurityNameInvestmentEquitySecuritiesReclassifiedFromHeldForPureInvestmentToHeldForPurposesOtherThanPureInvestmentReportingCompany: 33件
+- DocumentTitleCoverPage: 29件
+- PlaceOfFilingCoverPage: 29件
+- FilingDateCoverPage: 29件
+- TitleAndNameOfRepresentativeCoverPage: 29件
+
+## nil: 0件
+
+
+## unparseable: 2710件
+
+- TotalChangesOfItemsDuringThePeriod: 136件
+- InterimDividendPaidPerShareSummaryOfBusinessResults: 74件
+- DilutedEarningsPerShareSummaryOfBusinessResults: 74件
+- NumberOfSharesHeldOrdinarySharesInformationAboutDirectorsAndCorporateAuditors: 71件
+- NumberOfSharesIssuedSharesVotingRights: 65件
+- ProfitLossIFRS: 65件
+- DividendsSSIFRS: 58件
+- OtherComprehensiveIncomeIFRS: 54件
+- ComprehensiveIncomeIFRS: 47件
+- TransactionsWithOtherSegments: 44件
+- NumberOfSharesHeldInOthersNamesTreasurySharesEtc: 43件
+- PayoutRatioSummaryOfBusinessResults: 42件
+- PerformanceBasedRemunerationRemunerationByCategoryOfDirectorsAndOtherOfficers: 41件
+- AverageNumberOfTemporaryWorkers: 41件
+- PriceEarningsRatioSummaryOfBusinessResults: 37件
+- ChangesInOwnershipInterestInSubsidiariesSSIFRS: 36件
+- TotalTransactionsWithOwnersIFRS: 35件
+- PurchaseOfTreasurySharesSSIFRS: 33件
+- DividendPaidPerShareSummaryOfBusinessResults: 32件
+- NetAssets: 30件
+- ShareBasedPaymentTransactionsSSIFRS: 28件
+- NonAuditFeesReportingCompany: 27件
+- NonMonetaryRemunerationRemunerationByCategoryOfDirectorsAndOtherOfficers: 26件
+- PurchaseOfTreasuryStock: 26件
+- NonAuditFeesConsolidatedSubsidiaries: 23件
+- ForfeitureOfShareAcquisitionRightsSSIFRS: 22件
+- TransferFromOtherComponentsOfEquityToRetainedEarningsSSIFRS: 22件
+- NumberOfVotingRightsIssuedSharesVotingRights: 21件
+- NumberOfSharesHeldDetailsOfSpecifiedInvestmentEquitySecuritiesHeldForPurposesOtherThanPureInvestmentReportingCompany: 21件
+- BookValueDetailsOfSpecifiedInvestmentEquitySecuritiesHeldForPurposesOtherThanPureInvestmentReportingCompany: 21件
+
+## no_context: 0件
+
+
+## conflict: 0件
+
