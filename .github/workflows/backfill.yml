@@ -1,0 +1,88 @@
+name: backfill
+
+# S2-T2 バックフィル (月単位)。v1 (固定リビジョン、読み取り専用) から
+# 索引と日別 tar を取得し、pipeline.cli で Silver へ変換して、状態と
+# 結合結果を v2 データセットへ格納する。
+# - 月ごとに fetch (v2 から状態を復元) -> 日次変換 -> 月次結合 -> push。
+# - 日次変換のたびに目録だけを先に push するため、ジョブが途中で
+#   終わっても前進は残り、再実行は目録と目録駆動の再開で続きから進む。
+# - 索引はリビジョン固定で取得し、SHA-256 を照合してから使う
+#   (母数の確定のため)。
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "対象月 (YYYY-MM、カンマ区切りで複数可)"
+        required: true
+        type: string
+      max_docs:
+        description: "1日あたりの試行書類数の上限 (空なら無制限。動作確認用)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download pinned index from HF v1 (read-only)
+        run: |
+          set -euo pipefail
+          mkdir -p work/tars
+          curl -fL --retry 3 -o work/index.parquet \
+            "https://huggingface.co/datasets/Yoshi-Dai/financial-lakehouse/resolve/43540407ea82f792551e145598b1cf50cde6cb78/catalog/documents_index.parquet"
+          echo "68a8c01ea8cc1c952eeeb4b3b1eebf2dd52a3b56b511c45a8f9154b601512997  work/index.parquet" | sha256sum -c -
+      - name: Run months
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MONTHS: ${{ inputs.months }}
+          MAX_DOCS: ${{ inputs.max_docs }}
+          V1_BASE: "https://huggingface.co/datasets/Yoshi-Dai/financial-lakehouse/resolve/43540407ea82f792551e145598b1cf50cde6cb78"
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra months <<< "$MONTHS"
+          for month in "${months[@]}"; do
+            state="work/state-$month"
+            out="work/out-$month"
+            mkdir -p "$state" "$out"
+            python -m pipeline.hf_sync fetch --month "$month" \
+              --state-dir "$state" --out-dir "$out"
+            days=$(python -m pipeline.hf_sync days \
+              --month "$month" --index work/index.parquet)
+            for d in $days; do
+              y="${d:0:4}"; m="${d:5:2}"; dd="${d:8:2}"
+              curl -fL --retry 3 -o "work/tars/$d.tar" \
+                "$V1_BASE/raw/edinet/$y/$m/$dd.tar"
+              args=(--index work/index.parquet
+                    --since "$d" --until "$d"
+                    --tars-dir work/tars
+                    --state-dir "$state" --out-dir "$out")
+              if [ -n "$MAX_DOCS" ]; then args+=(--max-docs "$MAX_DOCS"); fi
+              python -m pipeline.cli "${args[@]}"
+              rm -f "work/tars/$d.tar"
+              python -m pipeline.hf_sync push-ledger --month "$month" \
+                --state-dir "$state"
+            done
+            python -m pipeline.cli --index work/index.parquet \
+              --since "$month-01" --until "$month-31" \
+              --tars-dir work/tars \
+              --state-dir "$state" --out-dir "$out" --combine-only
+            python -m pipeline.hf_sync push --month "$month" \
+              --state-dir "$state" --out-dir "$out"
+          done
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-${{ inputs.months }}
+          path: |
+            work/state-*/ledger.jsonl
+            work/out-*/run_summary.json
+          if-no-files-found: warn
