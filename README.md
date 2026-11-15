@@ -15,6 +15,13 @@ EDINET（金融庁の電子開示システム）に提出された開示書類�
 
 蓄積先は Hugging Face のデータセット `Yoshi-Dai/financial-lakehouse-v2` です。
 
+## 本番変換 (Silver)
+
+- `pipeline/`: XBRL から Silver (型つき事実) への本番変換。入口は `python -m pipeline.cli`。
+- 処理済みは目録 (ledger.jsonl) で管理し、再実行しても重複しない (冪等)。途中から再開でき、1書類の失敗は隔離して記録する。
+- 実行は GitHub Actions のワークフロー (`.github/workflows/convert.yml`) から行う。
+- 設計と実測の記録: `docs/records/2026-11-15-s2-t1-work-record.md`。
+
 ## 状態
 
 構築中。初期段階です。
