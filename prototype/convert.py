@@ -37,6 +37,11 @@ Step 2 塊1 の修正 (判定報告の open_caveats への対応):
     (例: .../E00988-000/2026-03-31/01/2026-06-24) ため、同一要素が書類ごとに
     別物に見えていた。正規化の規則は normalize_prefix の docstring と
     実行ログ (run_log.md) に明記する。
+(e) 重複除去の数値キー化 (Step 2 塊1 の独立照合フォロー): 従来は値の文字列形
+    (value_raw) を重複除去のキーにしていたため、符号付きゼロ (-0.0 と 0.0) や
+    小数表記の違い (802.0 に scale=6 を適用した値と 802000000) が別行として
+    残っていた。事実の取り込み時点で符号付きゼロを 0 に正規化し、重複除去の
+    キーは scale 適用後の Decimal の値そのもの (value_dec) に変更した。
 """
 import csv
 import hashlib
@@ -259,12 +264,16 @@ def parse_xbrl(data, doc_id, out_of_scope):
                 stats["unparseable"] += 1
                 out_of_scope["unparseable"].append((doc_id, local, f"bad scale {scale}"))
                 continue
+        if num == 0:
+            # 符号付きゼロ (-0) を 0 に正規化する (修正 (e))
+            num = Decimal(0)
         start, end, dims = contexts[ctx_ref]
         facts.append({
             "element": f"{normalize_prefix(ns)}:{local}" if ns else local,
             "element_ns": ns,
             "value": float(num),
             "value_raw": format(num, "f"),
+            "value_dec": num,
             "unit": units.get(unit_ref, ""),
             "context_start": start,
             "context_end": end,
@@ -361,12 +370,17 @@ def parse_inline_xbrl(root, doc_id, out_of_scope, contexts, units):
                 stats["unparseable"] += 1
                 out_of_scope["unparseable"].append((doc_id, local or name, f"bad scale {scale}"))
                 continue
+        if num == 0:
+            # sign="-" と本文 "0" の組み合わせ等で生じる符号付きゼロを
+            # 0 に正規化する (修正 (e))
+            num = Decimal(0)
         start, end, dims = contexts[ctx_ref]
         facts.append({
             "element": element,
             "element_ns": ns_uri or "",
             "value": float(num),
             "value_raw": format(num, "f"),
+            "value_dec": num,
             "unit": units.get(unit_ref, ""),
             "context_start": start,
             "context_end": end,
@@ -508,14 +522,15 @@ def main():
                     doc_stats_by_source["ixbrl"][k] += v
         if ix_parse_errors:
             entry["ix_parse_errors"] = ix_parse_errors
-        # 重複の除去 (同一 element/context/unit/value)。先勝ち。
+        # 重複の除去 (同一 element/context/unit/数値)。先勝ち。
+        # キーの値は文字列形ではなく scale 適用後の Decimal そのもの (修正 (e))。
         # .xbrl を先に処理するため、残った ixbrl 由来の行が「ixbrl のみ」になる。
         seen = set()
         point = "final" if is_correction else "as_filed"
         doc_rows = 0
         doc_ix_new = 0
         for f in doc_facts:
-            key = (f["element"], f["context_ref"], f["unit"], f["value_raw"])
+            key = (f["element"], f["context_ref"], f["unit"], f["value_dec"])
             if key in seen:
                 continue
             seen.add(key)
@@ -576,10 +591,13 @@ def main():
              "ixbrl_new_rows": total_ix_new,
              "parquet_sha256": log["parquet_sha256"]}
     log["comparison"] = {"before": previous, "after": after}
+    if previous:
+        # 修正前後の行数の差 = この修正で落ちた重複行の件数
+        log["comparison"]["duplicates_dropped"] = previous["rows"] - after["rows"]
     with open(os.path.join(OUT_DIR, "run_log.json"), "w", encoding="utf-8") as f:
         json.dump(log, f, ensure_ascii=False, indent=2)
     # 実行ログ (Markdown)
-    md = ["# 実行ログ（T3 変換、Step 2 塊1 修正後）\n"]
+    md = ["# 実行ログ（T3 変換、Step 2 塊1 修正・重複除去修正後）\n"]
     md.append(f"- 処理した書類: {sum(1 for d in log['docs'] if d['status'] == 'ok')}/{len(manifest)}")
     md.append(f"- Silver の行数: {log['rows']}")
     md.append(f"- parquet の SHA-256: {log['parquet_sha256']}")
@@ -606,9 +624,12 @@ def main():
         md.append(f"| ixbrl 由来で新たに加わった行数 | {previous['ixbrl_new_rows']} | {after['ixbrl_new_rows']} |")
         md.append(f"| parquet の SHA-256 | {previous['parquet_sha256']} | {after['parquet_sha256']} |")
         md.append("")
-        md.append("注: 修正前の統計は .xbrl からの抽出のみ (Inline XBRL の寄与 0 件)。"
-                  "修正後の全体統計は .xbrl と Inline XBRL の両方の抽出を含むため、"
-                  "nil と unparseable は .xbrl 由来のみの行でも併記する。")
+        md.append(f"重複除去の数値キー化 (修正 (e)) により、修正前 {previous['rows']} 行から "
+                  f"{log['comparison']['duplicates_dropped']} 件の重複行が落ち、"
+                  f"修正後は {after['rows']} 行になった。")
+        md.append("")
+        md.append("注: 修正前は、上書き前に読み取った前回の実行結果 (run_log.json と "
+                  "parquet) の値。nil と unparseable は全体と .xbrl 由来のみを併記する。")
     else:
         md.append("修正前の出力が無かったため比較なし。")
     md.append("")
@@ -627,7 +648,7 @@ def main():
     with open(os.path.join(OUT_DIR, "run_log.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(md))
     # 対象外の分類報告
-    lines = ["# 対象外要素の分類報告（T3、Step 2 塊1 修正後）\n"]
+    lines = ["# 対象外要素の分類報告（T3、Step 2 塊1 修正・重複除去修正後）\n"]
     for kind in ("non_numeric", "nil", "unparseable", "no_context", "conflict"):
         items = out_of_scope.get(kind, [])
         lines.append(f"## {kind}: {len(items)}件\n")
