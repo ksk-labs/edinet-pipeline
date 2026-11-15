@@ -1,11 +1,33 @@
-# 実行ログ（T3 変換）
+# 実行ログ（T3 変換、Step 2 塊1 修正後）
 
 - 処理した書類: 29/29
-- Silver の行数: 22194
-- parquet の SHA-256: 85ba807b04239c55dbde7da18eec5c62f1331eb84a0083fef246c7f57a6ffe1a
+- Silver の行数: 21189
+- parquet の SHA-256: a0bef894c7c13ab5fe7497f837f255a1544d5cb421f0b1d7185acbbc4819e8e9
 - 欠落した書類: なし
-- 統計: {'numeric': 22194, 'non_numeric': 8224, 'nil': 0, 'unparseable': 2710, 'no_context': 0}
-- 対象外の内訳: {'non_numeric': 8224, 'nil': 0, 'unparseable': 2710, 'no_context': 0}
+- 統計: {'numeric': 44388, 'non_numeric': 15828, 'nil': 6040, 'unparseable': 0, 'no_context': 0}
+- 統計 (由来別): {'xbrl': {'numeric': 22194, 'non_numeric': 7914, 'nil': 3020, 'unparseable': 0, 'no_context': 0}, 'ixbrl': {'numeric': 22194, 'non_numeric': 7914, 'nil': 3020, 'unparseable': 0, 'no_context': 0}}
+- 対象外の内訳: {'non_numeric': 15828, 'nil': 6040, 'unparseable': 0, 'no_context': 0}
+- dimension が空でない行数: 14476
+- ixbrl 由来で新たに加わった行数: 110
+
+## 要素名の正規化規則 (Step 2 塊1 (d))
+
+要素名の正規化規則 (Step 2 塊1 (d)): 要素の接頭辞は名前空間 URI から作る。URI のパス末尾のセグメントが日付 (YYYY-MM-DD) または数字のみである間はそれを取り除き続け、残った末尾のセグメントを接頭辞とする。例: http://disclosure.edinet-fsa.go.jp/jpcrp030000/asr/001/E00988-000/2026-03-31/01/2026-06-24 -> 接頭辞 E00988-000。標準タクソノミ (例: .../taxonomy/jppfs/2025-11-01/jppfs_cor) は末尾が日付でも数字でもないため変わらない (接頭辞 jppfs_cor)。Inline XBRL の name 属性は、文書の xmlns 宣言で名前空間 URI へ解決してから同じ規則を適用する。
+
+## 修正前後の比較
+
+| 項目 | 修正前 | 修正後 |
+|---|---|---|
+| Silver の行数 | 22194 | 21189 |
+| unparseable 件数 (全体) | 2710 | 0 |
+| unparseable 件数 (.xbrl 由来のみ) | 2710 | 0 |
+| nil 件数 (全体) | 0 | 6040 |
+| nil 件数 (.xbrl 由来のみ) | 0 | 3020 |
+| dimension が空でない行数 | 0 | 14476 |
+| ixbrl 由来で新たに加わった行数 | 0 | 110 |
+| parquet の SHA-256 | 85ba807b04239c55dbde7da18eec5c62f1331eb84a0083fef246c7f57a6ffe1a | a0bef894c7c13ab5fe7497f837f255a1544d5cb421f0b1d7185acbbc4819e8e9 |
+
+注: 修正前の統計は .xbrl からの抽出のみ (Inline XBRL の寄与 0 件)。修正後の全体統計は .xbrl と Inline XBRL の両方の抽出を含むため、nil と unparseable は .xbrl 由来のみの行でも併記する。
 
 ## tar のハッシュ（取得元）
 
@@ -27,32 +49,32 @@
 
 ## 書類ごとの結果
 
-- S100ZH4D (JG-L): ok facts=702
-- S100ZCDP (JG-L): ok facts=850
-- S100ZBQZ (JG-L): ok facts=1119
-- S100ZAWS (JG-L): ok facts=678
-- S100ZABE (JG-L): ok facts=889
-- S100ZASH (JG-L): ok facts=553
-- S100ZA8M (JG-U): ok facts=77
-- S100ZBGM (JG-U): ok facts=69
-- S100ZA0F (JG-U): ok facts=64
-- S100ZCII (JG-U): ok facts=77
-- S100ZH3O (JG-U): ok facts=72
-- S100Z6ZN (JG-U): ok facts=70
-- S100ZA5J (IF-L): ok facts=938
-- S100Z5CA (IF-L): ok facts=1346
-- S100Z5AL (IF-L): ok facts=1254
-- S100Z4CX (IF-L): ok facts=1141
-- S100Z4H9 (IF-L): ok facts=797
-- S100YH1E (IF-U): ok facts=906
-- S100YN5G (IF-U): ok facts=1218
-- S100YIBH (US-L): ok facts=839
-- S100YC5C (US-L): ok facts=953
-- S100YG81 (US-L): ok facts=794
-- S100YG5L (US-L): ok facts=926
-- S100X8TY (AMEND-120): ok facts=1192
-- S100XD4M (AMEND-130): ok facts=1192
-- S100XD30 (AMEND-120): ok facts=599
-- S100ZEHZ (AMEND-130): ok facts=599
-- S100XCU9 (AMEND-120): ok facts=1140
-- S100XZ2X (AMEND-130): ok facts=1140
+- S100ZH4D (JG-L): ok facts=686 extracted=1404 ixbrl_new=5
+- S100ZCDP (JG-L): ok facts=825 extracted=1700 ixbrl_new=8
+- S100ZBQZ (JG-L): ok facts=1069 extracted=2238 ixbrl_new=0
+- S100ZAWS (JG-L): ok facts=650 extracted=1356 ixbrl_new=0
+- S100ZABE (JG-L): ok facts=856 extracted=1778 ixbrl_new=0
+- S100ZASH (JG-L): ok facts=531 extracted=1106 ixbrl_new=0
+- S100ZA8M (JG-U): ok facts=74 extracted=154 ixbrl_new=0
+- S100ZBGM (JG-U): ok facts=66 extracted=138 ixbrl_new=0
+- S100ZA0F (JG-U): ok facts=61 extracted=128 ixbrl_new=0
+- S100ZCII (JG-U): ok facts=74 extracted=154 ixbrl_new=0
+- S100ZH3O (JG-U): ok facts=69 extracted=144 ixbrl_new=0
+- S100Z6ZN (JG-U): ok facts=67 extracted=140 ixbrl_new=0
+- S100ZA5J (IF-L): ok facts=871 extracted=1876 ixbrl_new=0
+- S100Z5CA (IF-L): ok facts=1277 extracted=2692 ixbrl_new=0
+- S100Z5AL (IF-L): ok facts=1188 extracted=2508 ixbrl_new=13
+- S100Z4CX (IF-L): ok facts=1061 extracted=2282 ixbrl_new=0
+- S100Z4H9 (IF-L): ok facts=738 extracted=1594 ixbrl_new=0
+- S100YH1E (IF-U): ok facts=837 extracted=1812 ixbrl_new=0
+- S100YN5G (IF-U): ok facts=1128 extracted=2436 ixbrl_new=0
+- S100YIBH (US-L): ok facts=816 extracted=1678 ixbrl_new=0
+- S100YC5C (US-L): ok facts=941 extracted=1906 ixbrl_new=8
+- S100YG81 (US-L): ok facts=773 extracted=1588 ixbrl_new=1
+- S100YG5L (US-L): ok facts=909 extracted=1852 ixbrl_new=1
+- S100X8TY (AMEND-120): ok facts=1135 extracted=2384 ixbrl_new=21
+- S100XD4M (AMEND-130): ok facts=1135 extracted=2384 ixbrl_new=21
+- S100XD30 (AMEND-120): ok facts=571 extracted=1198 ixbrl_new=0
+- S100ZEHZ (AMEND-130): ok facts=571 extracted=1198 ixbrl_new=0
+- S100XCU9 (AMEND-120): ok facts=1105 extracted=2280 ixbrl_new=16
+- S100XZ2X (AMEND-130): ok facts=1105 extracted=2280 ixbrl_new=16
