@@ -395,6 +395,7 @@ def parse_inline_xbrl(root, doc_id, out_of_scope, contexts, units):
 def _load_previous(out_dir):
     """上書き前の出力 (前回の実行結果) を修正前として読み取る。無ければ None。"""
     prev = {"rows": None, "unparseable": None, "nil": None,
+            "unparseable_xbrl": None, "nil_xbrl": None,
             "dimension_nonempty_rows": None, "ixbrl_new_rows": 0,
             "parquet_sha256": None}
     log_path = os.path.join(out_dir, "run_log.json")
@@ -407,9 +408,18 @@ def _load_previous(out_dir):
             st = old.get("stats_total", {})
             prev["unparseable"] = st.get("unparseable")
             prev["nil"] = st.get("nil")
+            # 由来別 (.xbrl のみ) の値と比較表の補助項目は、前回ログの
+            # stats_by_source と ixbrl_new_rows から読む (全体値で代用しない)
+            by_src = old.get("stats_by_source", {}).get("xbrl", {})
+            prev["unparseable_xbrl"] = by_src.get("unparseable")
+            prev["nil_xbrl"] = by_src.get("nil")
+            if old.get("ixbrl_new_rows") is not None:
+                prev["ixbrl_new_rows"] = old["ixbrl_new_rows"]
+            if old.get("dimension_nonempty_rows") is not None:
+                prev["dimension_nonempty_rows"] = old["dimension_nonempty_rows"]
         except (ValueError, OSError):
             pass
-    if os.path.exists(pq_path):
+    if prev["dimension_nonempty_rows"] is None and os.path.exists(pq_path):
         try:
             import pyarrow.parquet as pq
             t = pq.read_table(pq_path, columns=["dimension"])
@@ -617,9 +627,9 @@ def main():
         md.append("|---|---|---|")
         md.append(f"| Silver の行数 | {previous['rows']} | {after['rows']} |")
         md.append(f"| unparseable 件数 (全体) | {previous['unparseable']} | {after['unparseable']} |")
-        md.append(f"| unparseable 件数 (.xbrl 由来のみ) | {previous['unparseable']} | {after['unparseable_xbrl']} |")
+        md.append(f"| unparseable 件数 (.xbrl 由来のみ) | {previous['unparseable_xbrl']} | {after['unparseable_xbrl']} |")
         md.append(f"| nil 件数 (全体) | {previous['nil']} | {after['nil']} |")
-        md.append(f"| nil 件数 (.xbrl 由来のみ) | {previous['nil']} | {after['nil_xbrl']} |")
+        md.append(f"| nil 件数 (.xbrl 由来のみ) | {previous['nil_xbrl']} | {after['nil_xbrl']} |")
         md.append(f"| dimension が空でない行数 | {previous['dimension_nonempty_rows']} | {after['dimension_nonempty_rows']} |")
         md.append(f"| ixbrl 由来で新たに加わった行数 | {previous['ixbrl_new_rows']} | {after['ixbrl_new_rows']} |")
         md.append(f"| parquet の SHA-256 | {previous['parquet_sha256']} | {after['parquet_sha256']} |")
