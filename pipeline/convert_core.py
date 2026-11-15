@@ -141,9 +141,15 @@ def _new_out_of_scope():
     return {"non_numeric": [], "nil": [], "unparseable": [], "no_context": []}
 
 
+# 巨大なテキストノード (長大な注記等) を持つ実在書類があるため、
+# lxml の既定の上限 (XML_PARSE_HUGE なし) では解析に失敗する。
+# 上限を緩めても上限未満の文書の解析結果は変わらない。
+_XBRL_PARSER = etree.XMLParser(no_network=True, huge_tree=True)
+
+
 def parse_xbrl(data, doc_id, out_of_scope):
     """1つの .xbrl ファイルを解析し、(facts, stats) を返す。"""
-    root = etree.fromstring(data)
+    root = etree.fromstring(data, parser=_XBRL_PARSER)
     contexts = parse_contexts(root)
     units = parse_units(root)
     facts = []
@@ -349,7 +355,7 @@ def convert_document(zip_bytes, meta):
             doc_stats_by_source["xbrl"][k] += v
     # Inline XBRL: ディレクトリ (PublicDoc / AuditDoc) ごとに、
     # ix:resources の context/unit 定義を集めてから事実を抽出する
-    ix_parser = etree.XMLParser(no_network=True)
+    ix_parser = etree.XMLParser(no_network=True, huge_tree=True)
     ix_parse_errors = []
     groups = {}
     for n in htm_names:
