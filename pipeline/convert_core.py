@@ -134,7 +134,8 @@ def parse_units(root):
 
 
 def new_stats():
-    return {"numeric": 0, "non_numeric": 0, "nil": 0, "unparseable": 0, "no_context": 0}
+    return {"numeric": 0, "non_numeric": 0, "nil": 0, "unparseable": 0, "no_context": 0,
+            "recovered": 0}
 
 
 def _new_out_of_scope():
@@ -146,10 +147,27 @@ def _new_out_of_scope():
 # 上限を緩めても上限未満の文書の解析結果は変わらない。
 _XBRL_PARSER = etree.XMLParser(no_network=True, huge_tree=True)
 
+# 実在書類にあった欠陥: 命名実体参照のセミコロン欠落 (&gt が &gt; になるべき
+# ところ &gt のまま)。厳密な XML としては不正のため lxml は失敗するが、
+# 欠落した ; を補う以外の解釈は存在しないので、失敗時に限りこの3実体だけを
+# 補って再試行する。正常な書類はこの置換の対象にならない (置換対象は
+# 不正なバイト列だけ) ため、正常な書類の解析結果は変わらない。
+# 回復した書類は stats["recovered"] に数える。
+_MALFORMED_ENTITY_RE = re.compile(rb"&(gt|lt|amp)(?!;)")
+
 
 def parse_xbrl(data, doc_id, out_of_scope):
     """1つの .xbrl ファイルを解析し、(facts, stats) を返す。"""
-    root = etree.fromstring(data, parser=_XBRL_PARSER)
+    try:
+        root = etree.fromstring(data, parser=_XBRL_PARSER)
+    except etree.XMLSyntaxError:
+        fixed = _MALFORMED_ENTITY_RE.sub(rb"&\1;", data)
+        if fixed == data:
+            raise
+        root = etree.fromstring(fixed, parser=_XBRL_PARSER)
+        stats_recovered = True
+    else:
+        stats_recovered = False
     contexts = parse_contexts(root)
     units = parse_units(root)
     facts = []
@@ -213,6 +231,8 @@ def parse_xbrl(data, doc_id, out_of_scope):
             "source": "xbrl",
         })
         stats["numeric"] += 1
+    if stats_recovered:
+        stats["recovered"] += 1
     return facts, stats
 
 
