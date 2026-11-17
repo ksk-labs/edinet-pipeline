@@ -390,5 +390,123 @@ class RunWithRealClient429Test(unittest.TestCase):
         self.assertEqual(entry["error_kind"], "_RetryableHttpError")
 
 
+class RecordingHfApi(FakeHfApi):
+    """取得目録の push のたびに、内容と遠隔の状態を記録する偽 HfApi。"""
+
+    def __init__(self, remote=None):
+        super().__init__(remote)
+        self.acq_pushes = []
+
+    def upload_file(self, path_or_fileobj, path_in_repo, repo_id,
+                    repo_type="dataset", commit_message=None):
+        if (path_in_repo.startswith("acquisition/")
+                and path_in_repo.endswith("ledger.jsonl")):
+            with open(path_or_fileobj, "rb") as f:
+                content = f.read()
+            ok_paths = set()
+            for line in content.decode("utf-8").splitlines():
+                if line.strip():
+                    entry = json.loads(line)
+                    if entry.get("status") == "ok":
+                        ok_paths.add(entry["path"])
+            self.acq_pushes.append((ok_paths, set(self.remote)))
+        return super().upload_file(
+            path_or_fileobj, path_in_repo, repo_id,
+            repo_type=repo_type, commit_message=commit_message)
+
+
+class DroppingHfApi(FakeHfApi):
+    """upload_folder が何も上げない偽 HfApi (実在を確認できない状況)。"""
+
+    def upload_folder(self, folder_path, repo_id, repo_type="dataset",
+                      path_in_repo=None, commit_message=None):
+        return None
+
+
+class InterimPushTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.remote = {}
+        self.api = RecordingHfApi(self.remote)
+        download = make_hf_download(
+            self.remote, os.path.join(self.tmp.name, "cache"))
+        patchers = [
+            mock.patch.object(discovery, "HfApi", lambda: self.api),
+            mock.patch.object(discovery, "hf_hub_download", download),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def work_dir(self, name):
+        return os.path.join(self.tmp.name, name)
+
+    def test_ledger_pushed_incrementally_and_ok_always_exists(self):
+        docs = [
+            make_doc("S100AAAA", "2026-11-16 10:00"),
+            make_doc("S100BBBB", "2026-11-13 15:30"),
+        ]
+        bodies = {
+            ("S100AAAA", 1): ZIP_BODY, ("S100AAAA", 2): PDF_BODY,
+            ("S100BBBB", 1): ZIP_BODY, ("S100BBBB", 2): PDF_BODY,
+        }
+        client = FakeClient(docs, bodies)
+        summary = run_acquisition("2026-11-16", self.work_dir("w1"),
+                                  client=client)
+        self.assertEqual(summary["failed"], 0)
+        self.assertGreaterEqual(len(self.api.acq_pushes), 2)
+        for ok_paths, remote_paths in self.api.acq_pushes:
+            self.assertLessEqual(ok_paths, remote_paths)
+
+    def test_catalog_survives_crash_during_document_fetch(self):
+        class CrashingClient(FakeClient):
+            def fetch_document(self, doc_id, type_):
+                raise KeyboardInterrupt
+
+        docs = [make_doc("S100AAAA", "2026-11-16 10:00")]
+        client = CrashingClient(docs, {})
+        with self.assertRaises(KeyboardInterrupt):
+            run_acquisition("2026-11-16", self.work_dir("w1"),
+                            client=client)
+        rows = read_ledger(
+            self.remote, "catalog/month=2026-11/ledger.jsonl")
+        self.assertEqual([r["docID"] for r in rows], ["S100AAAA"])
+        self.assertFalse(any(p.startswith("raw/") for p in self.remote))
+
+
+class UploadUnconfirmedTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.remote = {}
+        self.api = DroppingHfApi(self.remote)
+        download = make_hf_download(
+            self.remote, os.path.join(self.tmp.name, "cache"))
+        patchers = [
+            mock.patch.object(discovery, "HfApi", lambda: self.api),
+            mock.patch.object(discovery, "hf_hub_download", download),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_unconfirmed_uploads_become_failed_rows(self):
+        docs = [make_doc("S100AAAA", "2026-11-16 10:00")]
+        bodies = {("S100AAAA", 1): ZIP_BODY, ("S100AAAA", 2): PDF_BODY}
+        client = FakeClient(docs, bodies)
+        summary = run_acquisition(
+            "2026-11-16", os.path.join(self.tmp.name, "w1"), client=client)
+        self.assertEqual(summary["downloaded"], 2)
+        self.assertEqual(summary["failed"], 2)
+        rows = read_ledger(
+            self.remote, "acquisition/month=2026-11/ledger.jsonl")
+        latest = latest_by_key(rows, lambda e: f"{e['doc_id']}:{e['kind']}")
+        for kind in ("zip", "pdf"):
+            entry = latest[f"S100AAAA:{kind}"]
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["error_kind"], "upload_unconfirmed")
+
+
 if __name__ == "__main__":
     unittest.main()
