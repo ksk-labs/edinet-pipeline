@@ -5,6 +5,11 @@ name: gold
 # - build: 第1期 Silver (提出日 2021-11-01 以降) から全量を生成する。
 # - update: Silver の月の透かしと比較して変化した月を検出し、
 #   影響会社の行だけを再生成して差し替える (Silver 日次→Gold 日次の順序)。
+# - sync-registry: 指標登録簿の正本 (edinet-definitions) の内容を
+#   v2 データセット上の写し (definitions/indicators.yaml) へ同期する。
+#   ローカルの HF トークン (muse-ksk) には v2 への書き込み権限がなく
+#   ローカルでは実行できないため、Actions 経由が唯一の経路である。
+#   登録簿の内容は dispatch 時の registry_yaml 入力で渡す。
 # 日次の定期実行への配線は、Silver 側の日次運転の観測と合わせて
 # 後続作業とする (本ワークフローは手動 dispatch の経路を用意する)。
 # 必要な秘密は HF_TOKEN のみ (入力の読み取りは公開データセットと
@@ -20,6 +25,11 @@ on:
         options:
           - build
           - update
+          - sync-registry
+      registry_yaml:
+        description: "sync-registry の場合に同期する指標登録簿 (indicators.yaml) の全文"
+        required: false
+        type: string
 
 jobs:
   gold:
@@ -36,12 +46,25 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           COMMAND: ${{ inputs.command }}
+          REGISTRY_YAML: ${{ inputs.registry_yaml }}
         run: |
           set -euo pipefail
           mkdir -p work/gold
-          python -m pipeline.gold "$COMMAND" \
-            --work-dir work/gold --upload \
-            | tee work/gold/result.json
+          if [ "$COMMAND" = "sync-registry" ]; then
+            if [ -z "$REGISTRY_YAML" ]; then
+              echo "registry_yaml input is required for sync-registry" >&2
+              exit 1
+            fi
+            python -c "import os; open('work/gold/registry.yaml', 'w', encoding='utf-8').write(os.environ['REGISTRY_YAML'])"
+            python -m pipeline.gold sync-registry \
+              --work-dir work/gold --upload \
+              --registry-file work/gold/registry.yaml \
+              | tee work/gold/result.json
+          else
+            python -m pipeline.gold "$COMMAND" \
+              --work-dir work/gold --upload \
+              | tee work/gold/result.json
+          fi
       - name: Upload run summary
         if: always()
         uses: actions/upload-artifact@v4
