@@ -102,7 +102,15 @@ jobs:
               capture_output=True, text=True)
           numbers = json.loads(existing.stdout or "[]")
           if numbers:
-              print(f"alert issue already open: #{numbers[0]['number']}")
+              # 同タイトルの Issue が開いている場合も、新しい警報を
+              # 埋もれさせないためコメントとして追記する。
+              number = numbers[0]["number"]
+              comment = ("継続確認で新たな警報が出ました。\n\n```json\n"
+                         + json.dumps(alerts, ensure_ascii=False, indent=2)
+                         + "\n```")
+              subprocess.run(["gh", "issue", "comment", str(number),
+                              "--body", comment], check=True)
+              print(f"alert appended to issue #{number}")
               sys.exit(0)
           body = ("pipeline.taxonomy の継続確認で警報が出ました。\n\n```json\n"
                   + json.dumps(alerts, ensure_ascii=False, indent=2)
