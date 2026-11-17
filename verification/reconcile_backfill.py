@@ -45,6 +45,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="バックフィルの全数照合")
     ap.add_argument("--index", required=True, help="固定リビジョンの v1 索引 parquet")
     ap.add_argument("--since", default="2021-11-01", help="対象の開始日 YYYY-MM-DD")
+    ap.add_argument("--until", default=None,
+                    help="対象の終了日 YYYY-MM-DD (省略時は上限なし)")
     ap.add_argument("--cache-dir", required=True, help="v2 の月次ファイルの置き場所")
     args = ap.parse_args(argv)
 
@@ -52,7 +54,9 @@ def main(argv=None):
         "doc_id", "submit_at", "xbrl_flag", "raw_zip_path", "doc_type"])
     rows = table.to_pylist()
     population = [r for r in rows
-                  if r["xbrl_flag"] and (r["submit_at"] or "")[:10] >= args.since]
+                  if r["xbrl_flag"] and (r["submit_at"] or "")[:10] >= args.since
+                  and (args.until is None
+                       or (r["submit_at"] or "")[:10] <= args.until)]
     no_zip = [r for r in population if not r["raw_zip_path"]]
     jobs = {}
     for r in population:

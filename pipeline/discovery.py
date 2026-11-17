@@ -49,6 +49,7 @@ from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError
 
 from .hf_sync import _with_retry
+from .ledger import JsonlLedger
 
 API_BASE = "https://api.edinet-fsa.go.jp/api/v2"
 DEFAULT_REPO = "Yoshi-Dai/financial-lakehouse-v2"
@@ -221,43 +222,6 @@ class EdinetClient:
                 f"書類の取得応答が想定した形式ではありません (type={type_}): "
                 + self._sanitize(body[:200]))
         return body
-
-
-class JsonlLedger:
-    """追記型の JSONL 目録。キーの最新行が状態 (pipeline.batch と同じ型)。
-
-    壊れた行 (中断で最終行が切れた場合など) は読み込み時に無視する。
-    """
-
-    def __init__(self, path, key_of):
-        self.path = path
-        self.key_of = key_of
-        self.latest = {}
-        self.corrupt_lines = 0
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        self.corrupt_lines += 1
-                        continue
-                    key = key_of(entry)
-                    if key:
-                        self.latest[key] = entry
-
-    def append(self, entry):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        key = self.key_of(entry)
-        if key:
-            self.latest[key] = entry
 
 
 def _acq_key(entry):

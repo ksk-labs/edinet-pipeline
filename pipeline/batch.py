@@ -20,7 +20,6 @@ zip/<doc_id>.zip にあるため、tar 単位でまとめて開いて取り出�
 import csv
 import hashlib
 import io
-import json
 import os
 import re
 import tarfile
@@ -33,6 +32,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .convert_core import convert_document, new_stats
+from .ledger import JsonlLedger
 
 SILVER_SCHEMA = pa.schema([
     ("doc_id", pa.string()),
@@ -158,32 +158,16 @@ def day_tar_name(raw_zip_path):
 
 # ---------------------------------------------------------------- 目録 (ledger)
 
-class Ledger:
-    """処理済み目録。JSONL の追記ファイルで、doc_id ごとの最新行が状態。"""
+class Ledger(JsonlLedger):
+    """処理済み目録。キーは doc_id で、土台は pipeline.ledger.JsonlLedger。
+
+    土台との違いは is_done だけ: 処理済みとみなすのは、目録の最新行が
+    ok で、入力 zip のハッシュが記録と一致し、出力シャードが実在する
+    場合に限る。
+    """
 
     def __init__(self, path):
-        self.path = path
-        self.latest = {}
-        self.attempts = Counter()
-        self.corrupt_lines = 0
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        # 中断で最終行が途中で切れた場合など。追記は末尾にしか
-                        # 起きないので、壊れた行は「記録なし」として扱う。
-                        self.corrupt_lines += 1
-                        continue
-                    doc_id = entry.get("doc_id")
-                    if not doc_id:
-                        continue
-                    self.latest[doc_id] = entry
-                    self.attempts[doc_id] += 1
+        super().__init__(path, lambda entry: entry.get("doc_id"))
 
     def is_done(self, doc_id, zip_sha256, shard_path):
         """入力が同一で出力が実在する場合だけ処理済みとみなす。"""
@@ -191,15 +175,6 @@ class Ledger:
         return (e is not None and e.get("status") == "ok"
                 and e.get("zip_sha256") == zip_sha256
                 and os.path.exists(shard_path))
-
-    def append(self, entry):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        self.latest[entry["doc_id"]] = entry
-        self.attempts[entry["doc_id"]] += 1
 
 
 # ---------------------------------------------------------------- バッチ実行
