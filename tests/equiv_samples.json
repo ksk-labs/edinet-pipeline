@@ -1,0 +1,57 @@
+{
+  "purpose": "arelle の版更新時に行う標本照合 (仕様 §2) の期待値。照合規則は S2-T3 と同じ (要素・期間開始・期間終了・次元・単位・値の多重集合)。",
+  "arelle_version": "2.47.5",
+  "expected_from": "既存 Silver (v2 データセット silver/month=<月>/silver.parquet) から 2026-11-17 に計算し、塊2 実施役の記録済み抽出出力 (全8書類) とも一致を確認した。",
+  "hash": "事実を [element, context_start, context_end, dimension, unit, repr(float(value))] の JSON 行に正規化し、ソートして改行で連結したものの SHA-256。実装は tests/equiv_check.py の canon_hash。",
+  "samples": [
+    {
+      "doc_id": "S100MQHX",
+      "month": "2021-11",
+      "facts": 315,
+      "facts_sha256": "5e19178e4a47179410db034af63b406964d0429971a3817751f134673053b1f0"
+    },
+    {
+      "doc_id": "S100PYBK",
+      "month": "2023-01",
+      "facts": 24,
+      "facts_sha256": "c8219b9a02a9b024113d7f3af7cabc470326a963c2a81f5b82ce74d3af36a070"
+    },
+    {
+      "doc_id": "S100PY3F",
+      "month": "2023-01",
+      "facts": 23,
+      "facts_sha256": "7fe1685d354d70d610e27cf6237e0cf1994e0e5406de0052d1cf3c8d5d8a0c6b"
+    },
+    {
+      "doc_id": "S100TV7A",
+      "month": "2024-06",
+      "facts": 1307,
+      "facts_sha256": "bc4c3adebd87b6b6805d99478066366ea18d66d43a1436b68e6523012fcf9206"
+    },
+    {
+      "doc_id": "S100W0ZR",
+      "month": "2025-06",
+      "facts": 2518,
+      "facts_sha256": "4d885d0deceed2a5d84833cd645b2794c372e9654017fc0b628a18a11e4ec38c"
+    },
+    {
+      "doc_id": "S100XRPR",
+      "month": "2026-03",
+      "facts": 1432,
+      "facts_sha256": "ca30ccaf623ae3f7300ee40742fd30a10d2fae0241cad86f3de40a164531d00a"
+    },
+    {
+      "doc_id": "S100XTLJ",
+      "month": "2026-03",
+      "facts": 941,
+      "facts_sha256": "7282b183f896c837d82117da84977452a8b4bb0f9a0e6f3db32a143cba02dde0"
+    },
+    {
+      "doc_id": "S100Y335",
+      "month": "2026-05",
+      "facts": 2518,
+      "facts_sha256": "8c84d905d2d6a0c1731de816e374e9b1162146320a720b97e7013943b711833b"
+    }
+  ],
+  "total_facts": 9078
+}
