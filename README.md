@@ -22,6 +22,12 @@ EDINET（金融庁の電子開示システム）に提出された開示書類�
 - 実行は GitHub Actions のワークフロー (`.github/workflows/convert.yml`) から行う。
 - 設計と実測の記録: `docs/records/2026-11-15-s2-t1-work-record.md`。
 
+## タクソノミ (P2-T9)
+
+- `pipeline/taxonomy.py`: EDINET タクソノミの取得・要素辞書の構築・年次更新の自動化と、規約文書 (証券コード協議会の取扱い要領) と arelle の EDINET プラグイン有効一覧の継続確認。入口は `python -m pipeline.taxonomy` (check / ingest / run / diff / quarantine)。
+- 実行は GitHub Actions のワークフロー (`.github/workflows/taxonomy_check.yml`) から行う (月次確認+11月の重点確認)。辞書と差分は v2 データセットの `taxonomy/` 配下に保存する。
+- 設計と実測の記録: `docs/records/2026-11-17-p2-t9-taxonomy-work-record.md`。
+
 ## 状態
 
 構築中。初期段階です。
