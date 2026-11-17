@@ -1,0 +1,19 @@
+# 指標に効く要素の一覧 (P2-T9 の判断事項の判定に使う)
+#
+# 正本は指標登録簿 (ksk-labs/edinet-definitions の indicators.yaml、
+# version 3、2026-11-17 取得) で、本ファイルはその要素対応の写しである。
+# 登録簿が変わったら、本ファイルも同じ変更で更新すること (手作業の
+# 二重管理であることを明示する。恒常対策は未決: 登録簿からの機械生成)。
+# 形式: 1行1要素 (Silver の element 列と同じ 接頭辞:要素名)。
+jpcrp_cor:NetIncomeLossAttributableToOwnersOfParentUSGAAPSummaryOfBusinessResults
+jpcrp_cor:NetIncomeLossSummaryOfBusinessResults
+jpcrp_cor:NetSalesSummaryOfBusinessResults
+jpcrp_cor:ProfitLossAttributableToOwnersOfParentIFRSSummaryOfBusinessResults
+jpcrp_cor:ProfitLossAttributableToOwnersOfParentSummaryOfBusinessResults
+jpcrp_cor:RateOfReturnOnEquityIFRSSummaryOfBusinessResults
+jpcrp_cor:RateOfReturnOnEquitySummaryOfBusinessResults
+jpcrp_cor:RateOfReturnOnEquityUSGAAPSummaryOfBusinessResults
+jpcrp_cor:RevenueIFRSSummaryOfBusinessResults
+jpcrp_cor:RevenuesUSGAAPSummaryOfBusinessResults
+jpigp_cor:OperatingProfitLossIFRS
+jppfs_cor:OperatingIncome
