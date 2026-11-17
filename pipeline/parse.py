@@ -9,6 +9,10 @@ GitHub Actions のジョブ分割 (plan -> parse マトリクス -> merge) に�
   zip を対象として計画 (plan.json) を作る。解析済みの判定は解析目録
   (parse/month=YYYY-MM/ledger.jsonl) の最新行が ok で、入力 zip の
   SHA-256 が取得目録の記録と一致する場合だけとする (冪等)。
+  隔離・失敗が連続で MAX_PARSE_ATTEMPTS 回に達した書類は、恒常的に
+  読めないものとして計画の対象から外す (退避。plan.json の retired に
+  理由つきで残り、監視が拾う)。書類 ID を明示指定した場合は退避を
+  適用せず再試行する (運用側の明示が優先)。
 - shard: 計画の書類を担当分だけ解析する。書類ごとに Silver の行
   (parquet)、解析目録の行 (results.jsonl)、提出者拡張タクソノミの
   表示名 (labels.jsonl) を作業ディレクトリへ書く。HF へは書かない。
@@ -116,6 +120,12 @@ _TAXONOMY_DATE_RE = re.compile(
 # 検証の別プロセスの上限。実測は約40秒/書類 (初回のタクソノミ取得を含む)
 # だが、キャッシュが無い初回や大きな書類に余裕を持たせる。
 VALIDATION_TIMEOUT_SEC = 900
+
+# 隔離・失敗した書類の再試行の上限 (連続回数)。一時的な失敗 (HF や
+# ネットワークの一時障害、キャッシュの破損) は日単位で回復しうるため、
+# 営業日1週間分に当たる5回までは毎日の計画に載せ、それを超えたら
+# 恒常的な問題とみなして退避させる (S2-T5-4)。
+MAX_PARSE_ATTEMPTS = 5
 
 
 def _now():
@@ -522,6 +532,27 @@ def run_validation(zip_path, webcache_dir, work_dir, doc_id):
 
 
 
+def failure_streaks(parse_ledgers):
+    """解析目録の履歴から、書類ごとの連続失敗回数 (隔離・失敗) を数える。
+
+    parse_ledgers は _fetch_ledgers の戻り値 {month: [entry, ...]}。
+    行は追記順 (時系列) に走査し、ok の行が来れば 0 に戻す。
+    戻り値: {doc_id: 連続回数} (監視も同じ計算を使う)。
+    """
+    streaks = {}
+    for month in sorted(parse_ledgers):
+        for entry in parse_ledgers[month]:
+            doc_id = entry.get("doc_id")
+            if not doc_id:
+                continue
+            status = entry.get("status")
+            if status == "ok":
+                streaks[doc_id] = 0
+            elif status in ("quarantined", "failed"):
+                streaks[doc_id] = streaks.get(doc_id, 0) + 1
+    return streaks
+
+
 def run_plan(date, doc_ids, max_docs, work_dir, repo=DEFAULT_REPO):
     """未解析の zip を対象として計画を作り、plan.json を書く。
 
@@ -551,12 +582,14 @@ def run_plan(date, doc_ids, max_docs, work_dir, repo=DEFAULT_REPO):
         for e in entries:
             if e.get("doc_id"):
                 parse_latest[e["doc_id"]] = e
+    streaks = failure_streaks(parse)
 
     wanted_ids = None
     if doc_ids:
         wanted_ids = {d.strip() for d in doc_ids.split(",") if d.strip()}
     targets = []
-    skipped = {"done": 0, "no_catalog": 0, "filtered": 0}
+    retired = []
+    skipped = {"done": 0, "no_catalog": 0, "filtered": 0, "retired": 0}
     for doc_id, entry in sorted(acq_latest.items()):
         if entry.get("status") != "ok":
             continue
@@ -576,6 +609,17 @@ def run_plan(date, doc_ids, max_docs, work_dir, repo=DEFAULT_REPO):
                 and done.get("zip_sha256") == entry.get("sha256")):
             skipped["done"] += 1
             continue
+        if (wanted_ids is None
+                and streaks.get(doc_id, 0) >= MAX_PARSE_ATTEMPTS):
+            skipped["retired"] += 1
+            retired.append({
+                "doc_id": doc_id,
+                "attempts": streaks[doc_id],
+                "last_status": done.get("status") if done else None,
+                "last_reason": (done.get("reason") if done else None)
+                               or (done.get("error_kind") if done else None),
+            })
+            continue
         targets.append({
             "doc_id": doc_id,
             "zip_path": entry.get("path"),
@@ -591,7 +635,7 @@ def run_plan(date, doc_ids, max_docs, work_dir, repo=DEFAULT_REPO):
         targets = targets[:max_docs]
     plan = {
         "generated_at": _now(), "date": date, "doc_ids": doc_ids,
-        "max_docs": max_docs, "docs": targets,
+        "max_docs": max_docs, "docs": targets, "retired": retired,
         "counts": {"targets": len(targets), "skipped": skipped,
                    "acquisition_zip_docs": len(acq_latest)},
     }

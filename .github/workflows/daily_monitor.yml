@@ -1,0 +1,53 @@
+name: daily_monitor
+
+# S2-T5 §5 監視 (pipeline.monitor)。その日の取得・解析・コードリストの
+# 状態を、v2 データセット上の成果物 (目録と実行サマリ) から点検し、
+# 日次報告 (monitor/reports/date=YYYY-MM-DD/report.json) と状態ファイル
+# (monitor/state.json) を v2 へ保存する。警報 (取得の失敗、スナップ
+# ショットの欠落、隔離件数、滞留、連続失敗) は報告と状態ファイルに
+# 載る。警報があっても監視自体は成功として終わる。
+# - schedule: 毎日 21:30 JST。その日の全工程 (取得 03:30/15:30、
+#   解析 05:30、コードリスト 09:15/15:15) の後に、その日の最終状態を
+#   点検する。時刻の根拠は S2-T5-4 の作業記録。
+# - workflow_dispatch: 日付 (JST) を指定して手動実行する。date が空なら
+#   当日が対象になる。
+
+on:
+  schedule:
+    - cron: "30 12 * * *"  # 毎日 21:30 JST
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "監視の実行日 (YYYY-MM-DD、JST。空なら当日)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run monitoring
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATE: ${{ inputs.date }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          args=(--work-dir work/monitor)
+          if [ -n "$DATE" ]; then args+=(--date "$DATE"); fi
+          python -m pipeline.monitor run "${args[@]}" | tee work/monitor-report.json
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-${{ inputs.date }}
+          path: work/monitor-report.json
+          if-no-files-found: warn

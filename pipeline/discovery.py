@@ -19,9 +19,13 @@ EDINET API で対象日の書類一覧を取得し、次を v2 データセッ�
 
 取得状態は取得目録 (acquisition/month=YYYY-MM/ledger.jsonl) で管理し、
 「目録が ok で、保存先が HF 上に実在する」原形は再取得しない (冪等)。
-原形のアップロードが済んでから目録を push するので、目録が ok を
-主張して実体が無い状態にはならない。1書類の失敗で全体を止めず、
-失敗は目録へ理由つきで記録して次回の実行で再試行する。
+書類目録は観測の記録であり原形の実在に依存しないため、一覧の取得が
+済んだ時点で先に push する。取得目録は、原形のアップロードが保存先
+ディレクトリ単位で済むたびに途中でも push する (S2-T5-4)。どちらの
+途中 push でも「目録が ok を主張して実体が無い」状態にはならない:
+ok の行は、アップロード後に遠隔で実在を確認できた分だけを書く。
+1書類の失敗で全体を止めず、失敗は目録へ理由つきで記録して次回の
+実行で再試行する。
 
 認証は環境変数 EDINET_API_KEY (EDINET) と HF_TOKEN (HF への書き込み、
 huggingface_hub が自動で読む) を使う。API キーはログと目録に出さない
@@ -322,8 +326,9 @@ def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
     """対象日1日分の取得を行い、実行サマリ (dict) を返す。
 
     work_dir の配下に state/ (目録)、stage/ (アップロード前の原形)、
-    out/ (応答 JSON と実行サマリ) を作る。目録は HF から復元して追記し、
-    原形のアップロードが済んでから push する。
+    out/ (応答 JSON と実行サマリ) を作る。目録は HF から復元して追記
+    する。書類目録は一覧の取得が済んだ時点で、取得目録は原形の
+    アップロードが進むたびに途中でも push する。
     """
     month = _month_of(date)
     state_dir = os.path.join(work_dir, "state")
@@ -366,10 +371,20 @@ def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
         _upload_file(api, repo, response_local, response_repo_path,
                      f"discovery {date}: document list response")
 
-    # 書類目録への追記 (一覧の全行が対象。原形の取得上限とは独立)
+    # 書類目録への追記 (一覧の全行が対象。原形の取得上限とは独立)。
+    # 観測の記録は原形の実在に依存しないため、ここで先に push する。
+    # 実行がこの後に落ちても、その日の観測は残る。
     for doc in results:
         catalog.append(catalog_row(doc, fetched_at))
         summary["catalog_rows_appended"] += 1
+    _upload_file(api, repo, cat_path_local,
+                 f"catalog/month={month}/ledger.jsonl",
+                 f"discovery {date}: catalog ledger")
+
+    def push_acquisition_ledger():
+        _upload_file(api, repo, acq_path_local,
+                     f"acquisition/month={month}/ledger.jsonl",
+                     f"discovery {date}: acquisition ledger")
 
     # 原形の取得 (書類単位で失敗を隔離する)
     wanted = [k for k in _KIND_BY_NAME if kinds is None or k in kinds]
@@ -432,16 +447,28 @@ def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
             })
             summary["downloaded"] += 1
 
-    # 原形のアップロード (保存先ディレクトリごと。済んでから目録を push する)
+    # 原形のアップロード (保存先ディレクトリごと)。ディレクトリが
+    # 済むたびに、その分の ok を遠隔で確認して取得目録へ書き、途中でも
+    # push する。確認できなかった分は保留し、最後にもう一度確認する。
+    pending_ok = list(ok_entries)
     for rel_dir, local_dir in sorted(staged_dirs.items()):
         kind = rel_dir.rsplit("/", 1)[-1]
         _upload_folder(api, repo, local_dir, rel_dir,
                        f"discovery {date}: raw {kind}")
+        remote_now = _remote_files(api, repo)
+        confirmed = [e for e in pending_ok
+                     if os.path.dirname(e["path"]) == rel_dir
+                     and e["path"] in remote_now]
+        for entry in confirmed:
+            acq.append(entry)
+            pending_ok.remove(entry)
+        if confirmed:
+            push_acquisition_ledger()
 
-    # 目録の ok は、アップロード後に遠隔で実在を確認できた分だけ書く
-    if ok_entries:
+    # 保留分の最終確認。目録の ok は、遠隔で実在を確認できた分だけ書く
+    if pending_ok:
         remote_after = _remote_files(api, repo)
-        for entry in ok_entries:
+        for entry in pending_ok:
             if entry["path"] in remote_after:
                 acq.append(entry)
                 continue
@@ -458,18 +485,13 @@ def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
     for entry in failed_entries:
         acq.append(entry)
 
-    # 目録と実行サマリの push
+    # 目録と実行サマリの push (書類目録は前段で push 済み)
     summary["finished_at"] = _now()
     summary["requests"] = client.request_count
     summary_path = os.path.join(out_dir, "run_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    _upload_file(api, repo, cat_path_local,
-                 f"catalog/month={month}/ledger.jsonl",
-                 f"discovery {date}: catalog ledger")
-    _upload_file(api, repo, acq_path_local,
-                 f"acquisition/month={month}/ledger.jsonl",
-                 f"discovery {date}: acquisition ledger")
+    push_acquisition_ledger()
     _upload_file(api, repo, summary_path,
                  f"acquisition/month={month}/run_summary-{date}-{stamp}.json",
                  f"discovery {date}: run summary")

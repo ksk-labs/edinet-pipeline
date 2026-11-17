@@ -230,5 +230,117 @@ class WithRetrySharingTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
 
+class PlanTestBase(unittest.TestCase):
+    def setUp(self):
+        self.store = {}
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        api = _FakeApi(self.store)
+
+        def fake_download(repo_id, filename, repo_type=None, local_dir=None,
+                          token=None):
+            path = os.path.join(self.tmp, "dl",
+                                filename.replace("/", "_"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(self.store[filename])
+            return path
+
+        for p in [
+            mock.patch.object(parse, "HfApi", lambda: api),
+            mock.patch.object(parse, "hf_hub_download", fake_download),
+        ]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def put(self, path, data):
+        self.store[path] = data
+
+    def setup_doc(self, doc_id, parse_entries, sha="sha-current"):
+        self.put("acquisition/month=2026-11/ledger.jsonl", _jsonl_bytes([
+            {"doc_id": doc_id, "kind": "zip", "status": "ok",
+             "path": f"raw/edinet/2026/11/16/zip/{doc_id}.zip",
+             "sha256": sha, "fetched_at": "2026-11-17T00:00:00+00:00"},
+        ]))
+        self.put("catalog/month=2026-11/ledger.jsonl", _jsonl_bytes([
+            {"docID": doc_id, "submitDateTime": "2026-11-16 10:00",
+             "docTypeCode": "120", "parentDocID": None},
+        ]))
+        if parse_entries is not None:
+            self.put("parse/month=2026-11/ledger.jsonl",
+                     _jsonl_bytes(parse_entries))
+
+    def run_plan(self, date=None, doc_ids=None):
+        return parse.run_plan(date, doc_ids, None,
+                              os.path.join(self.tmp, "plan"),
+                              repo="fake/repo")
+
+
+def _parse_entry(doc_id, status, **kw):
+    entry = {"doc_id": doc_id, "status": status,
+             "month": "2026-11", "submit_at": "2026-11-16 10:00",
+             "doc_type": "120", "parent_doc_id": None,
+             "zip_sha256": "sha-current"}
+    entry.update(kw)
+    return entry
+
+
+class PlanRetirementTest(PlanTestBase):
+    """再試行の上限: 連続失敗が上限に達した書類は計画から外れる。"""
+
+    def test_retired_after_max_consecutive_failures(self):
+        entries = [_parse_entry("D1", "quarantined", reason="bad_zip")
+                   for _ in range(parse.MAX_PARSE_ATTEMPTS)]
+        self.setup_doc("D1", entries)
+        plan = self.run_plan()
+        self.assertEqual(plan["counts"]["targets"], 0)
+        self.assertEqual(plan["counts"]["skipped"]["retired"], 1)
+        self.assertEqual(plan["retired"][0]["doc_id"], "D1")
+        self.assertEqual(plan["retired"][0]["attempts"],
+                         parse.MAX_PARSE_ATTEMPTS)
+        self.assertEqual(plan["retired"][0]["last_reason"], "bad_zip")
+
+    def test_targeted_below_max_failures(self):
+        entries = [_parse_entry("D1", "failed", error_kind="OSError")
+                   for _ in range(parse.MAX_PARSE_ATTEMPTS - 1)]
+        self.setup_doc("D1", entries)
+        plan = self.run_plan()
+        self.assertEqual(plan["counts"]["targets"], 1)
+        self.assertEqual(plan["retired"], [])
+
+    def test_ok_resets_the_streak(self):
+        entries = (
+            [_parse_entry("D1", "quarantined", reason="bad_zip")
+             for _ in range(parse.MAX_PARSE_ATTEMPTS)]
+            + [_parse_entry("D1", "ok", zip_sha256="sha-old")]
+            + [_parse_entry("D1", "quarantined", reason="zero_facts")])
+        self.setup_doc("D1", entries)
+        plan = self.run_plan()
+        self.assertEqual(plan["counts"]["targets"], 1)
+        self.assertEqual(plan["retired"], [])
+
+    def test_explicit_doc_ids_bypass_retirement(self):
+        entries = [_parse_entry("D1", "quarantined", reason="bad_zip")
+                   for _ in range(parse.MAX_PARSE_ATTEMPTS + 2)]
+        self.setup_doc("D1", entries)
+        plan = self.run_plan(doc_ids="D1")
+        self.assertEqual(plan["counts"]["targets"], 1)
+        self.assertEqual(plan["retired"], [])
+
+
+class FailureStreaksTest(unittest.TestCase):
+    def test_counts_only_consecutive_non_ok(self):
+        ledgers = {"2026-11": [
+            {"doc_id": "A", "status": "quarantined"},
+            {"doc_id": "A", "status": "failed"},
+            {"doc_id": "B", "status": "failed"},
+            {"doc_id": "A", "status": "ok"},
+            {"doc_id": "A", "status": "quarantined"},
+            {"doc_id": "B", "status": "ok"},
+        ]}
+        streaks = parse.failure_streaks(ledgers)
+        self.assertEqual(streaks, {"A": 1, "B": 0})
+
+
 if __name__ == "__main__":
     unittest.main()

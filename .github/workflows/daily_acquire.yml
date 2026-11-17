@@ -3,14 +3,18 @@ name: daily_acquire
 # S2-T5 §1 日次取得 (pipeline.discovery)。EDINET API で対象日の書類一覧と
 # 書類の原形 (zip・PDF・添付・英語) を取得し、書類目録と raw を v2
 # データセットへ保存する。CSV (type=5) は取得しない。
+# - schedule: 1日2回 (03:30 JST と 15:30 JST)。いずれも対象は前日
+#   (Asia/Tokyo) で、2回目は1回目の失敗・滞留への同日回復である
+#   (冪等なため取得済みは飛ばされる)。時刻の根拠は S2-T5-4 の作業記録。
 # - workflow_dispatch: 日付を指定して手動実行する。date が空なら前日
 #   (Asia/Tokyo) が対象になる。
-# - cron 化するときは schedule のコメントを外すだけでよい (date の
-#   既定が前日 JST のため)。定期実行の有効化は本塊の範囲外。
 # - 取得状態は v2 の取得目録 (acquisition/month=YYYY-MM/ledger.jsonl) で
 #   管理され、再実行しても取得済みの原形は再取得しない (冪等)。
 
 on:
+  schedule:
+    - cron: "30 18 * * *"  # 毎日 03:30 JST
+    - cron: "30 6 * * *"  # 毎日 15:30 JST
   workflow_dispatch:
     inputs:
       date:
@@ -28,8 +32,6 @@ on:
         required: false
         type: string
         default: ""
-  # schedule:
-  #   - cron: "30 21 * * *"  # 毎日 06:30 JST
 
 jobs:
   acquire:

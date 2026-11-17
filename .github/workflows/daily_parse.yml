@@ -10,10 +10,14 @@ name: daily_parse
 # - merge: 全 shard の結果を月別の Silver へ反映し、解析目録を push する。
 # - workflow_dispatch: 日付を指定して手動実行する。date は提出日で、
 #   空なら未解析の全件が対象になる (doc_ids 指定時はそちらが優先)。
-# - cron 化は schedule を足すだけでよいが、定期実行の有効化は本塊の範囲外。
+# - schedule: 毎日 05:30 JST。date は空で実行し、未解析の全件を対象に
+#   する (取得の2回目で増えた分と前日の取りこぼしは、翌日の実行が
+#   自動で回収する)。時刻の根拠は S2-T5-4 の作業記録。
 # - arelle の版は 2.47.5 に固定する (版更新時は標本照合が必須。仕様 §2)。
 
 on:
+  schedule:
+    - cron: "30 20 * * *"  # 毎日 05:30 JST
   workflow_dispatch:
     inputs:
       date:
