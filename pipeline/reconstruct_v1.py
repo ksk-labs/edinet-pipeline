@@ -44,6 +44,21 @@ def normalize_name(name):
     return s
 
 
+def majority_jcn(counts):
+    """観測回数が最大の法人番号を返す。同数が複数あれば None (多数派なし)。
+
+    多数派の判定を決定的にするための規則 (P2-T3 で導入。従来は
+    dict の挿入順に依存していた)。同数の場合は「多数の観測を
+    優先する」前提自体が成立しないため、多数派なしとして扱い、
+    その法人番号を接続の根拠にしない。
+    """
+    if not counts:
+        return None
+    top = max(counts.values())
+    winners = [j for j, c in counts.items() if c == top]
+    return winners[0] if len(winners) == 1 else None
+
+
 def change_key(name):
     """変更判定用のキー。正規化し、英字を小文字化し、前後の法人格を除く。"""
     s = normalize_name(name).casefold()
@@ -189,8 +204,8 @@ def main(argv):
             for cb in codes[i + 1:]:
                 linked_pairs.add((ca, cb))
                 rows_a, rows_b = jcn_by_code[ca][jcn], jcn_by_code[cb][jcn]
-                majority_a = jcn == max(jcn_by_code[ca], key=jcn_by_code[ca].get)
-                majority_b = jcn == max(jcn_by_code[cb], key=jcn_by_code[cb].get)
+                majority_a = majority_jcn(jcn_by_code[ca]) == jcn
+                majority_b = majority_jcn(jcn_by_code[cb]) == jcn
                 name_agree = bool(names_by_code[ca] & names_by_code[cb])
                 sec_conflict = bool(
                     secs_by_code[ca] and secs_by_code[cb]
