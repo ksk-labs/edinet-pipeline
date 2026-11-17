@@ -1,0 +1,48 @@
+name: daily_codelist
+
+# S2-T5 §4 コードリストの日次スナップショット (pipeline.codelist)。
+# 金融庁の固定 URL から EDINET コードリスト (Edinetcode.zip) を取得し、
+# v2 データセットへ日次スナップショットとして不変に保存して、前回
+# 成功分との差分を生成する。保存先は二重化する (日付つきスナップ
+# ショットと、原形 zip のアーカイブ)。
+# - workflow_dispatch: 手動実行する。スナップショットの日付は CSV の
+#   1行目にあるダウンロード実行日で決まるため、入力は無い。同じ日の
+#   再実行は冪等で、確保済みなら何も積まない。
+# - 1日に複数回、時間をずらして試行する形が前提である (当日1回の
+#   成功で確保)。schedule の有効化は S2-T5-4 (#29) の範囲のため、
+#   ここではコメントのまま置く。
+# - コードリストの取得に EDINET API キーは不要である (ダウンロード
+#   サイトの固定 URL)。必要な秘密は HF_TOKEN のみ。
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "15 0 * * *"  # 毎日 09:15 JST
+  #   - cron: "15 6 * * *"  # 毎日 15:15 JST
+
+jobs:
+  codelist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run codelist snapshot
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -m pipeline.codelist run --work-dir work/codelist
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codelist-run
+          path: |
+            work/codelist/state/ledger.jsonl
+            work/codelist/out/run_summary.json
+          if-no-files-found: warn
