@@ -1,0 +1,56 @@
+name: extension_dict
+
+# 拡張タクソノミ表示名の要素辞書 (P2-T10、pipeline.extension_dict) を
+# v2 データセットの parse/month=*/extension_labels.jsonl から再構築し、
+# dictionary/ へ配置する運用ワークフロー。日次解析のつど自動では
+# 回さず、表示名の入力が増えたときに手動で dispatch する
+# (辞書の再構築は入力全部からの冪等な置き換え)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "対象月 YYYY-MM のカンマ区切り (空欄は全月)。成果物は辞書全体の置き換えのため、一部の月だけを指定すると allow_partial_upload を有効にしない限りエラーで止まる (辞書がその月分だけに縮むのを防ぐ)"
+        required: false
+        type: string
+      allow_partial_upload:
+        description: "部分月での upload を許可し、辞書全体をその月分だけで置き換える (意図する場合のみ有効化)"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Build and upload extension dictionary
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MONTHS: ${{ inputs.months }}
+          ALLOW_PARTIAL: ${{ inputs.allow_partial_upload }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          args=(--work-dir work/dict --upload)
+          if [ -n "$MONTHS" ]; then
+            args+=(--months "$MONTHS")
+          fi
+          if [ "$ALLOW_PARTIAL" = "true" ]; then
+            args+=(--allow-partial-upload)
+          fi
+          python -m pipeline.extension_dict sync "${args[@]}" \
+            | tee work/summary.json
+      - name: Upload build summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-dict-summary
+          path: work/summary.json
+          if-no-files-found: warn
