@@ -51,7 +51,10 @@ Silver への追記 (仕様 §3):
   受け渡しとして parse/month=YYYY-MM/extension_labels.jsonl に分ける。
 - 訂正の系譜 (superseded_by) は工程1の確定規則と同一 (同一親への訂正が
   複数ある場合は、提出日時が最も新しい訂正1件。同点なら doc_id の
-  大きい方)。merge が、今回取り込む訂正と既存 Silver の状態から
+  大きい方)。訂正として扱うのは doc_type=130 のみであり、040
+  (訂正届出書) や 350 (大量保有の変更報告) など、目録上 parent_doc_id を
+  持つ他の書類種別は系譜の対象ではない (convert_core の確定規則)。
+  merge が、今回取り込む訂正と既存 Silver の状態から
   勝者を決め直し、親書類の行の superseded_by も必要なら書き換える。
 - 成果物には出所 (源泉の種別・源泉側の識別子・取得日時・再配布可否) を
   解析目録の各行に持たせる。
@@ -858,14 +861,18 @@ def run_merge(plan_path, shards_dir, work_dir, repo=DEFAULT_REPO):
         for e in entries:
             if e.get("doc_id"):
                 parse_latest[e["doc_id"]] = e
-    # 既に Silver にある訂正 (解析目録で ok のもの): 親 -> {訂正: 提出日時}
+    # 既に Silver にある訂正 (解析目録で ok のもの): 親 -> {訂正: 提出日時}。
+    # 訂正として扱うのは doc_type=130 のみ (工程1の確定規則)。
+    # 040 (訂正届出書) や 350 (大量保有の変更報告) なども目録上は
+    # parent_doc_id を持つが、系譜の対象ではない。
     known_corrections = {}
     for doc_id, e in parse_latest.items():
-        if e.get("status") == "ok" and e.get("parent_doc_id"):
+        if (e.get("status") == "ok" and e.get("doc_type") == "130"
+                and e.get("parent_doc_id")):
             known_corrections.setdefault(e["parent_doc_id"], {})[doc_id] = \
                 e.get("submit_at")
     for doc_id, e in ok_docs.items():
-        if e.get("parent_doc_id"):
+        if e.get("doc_type") == "130" and e.get("parent_doc_id"):
             known_corrections.setdefault(e["parent_doc_id"], {})[doc_id] = \
                 e.get("submit_at")
 
@@ -886,7 +893,7 @@ def run_merge(plan_path, shards_dir, work_dir, repo=DEFAULT_REPO):
     # 影響する月の集合: 取り込む書類の月 + 勝者が変わりうる親の月
     affected_parents = set()
     for e in ok_docs.values():
-        if e.get("parent_doc_id"):
+        if e.get("doc_type") == "130" and e.get("parent_doc_id"):
             affected_parents.add(e["parent_doc_id"])
     months = {e["month"] for e in ok_docs.values()}
     for parent in affected_parents:
@@ -1065,6 +1072,99 @@ def _download_month_silver(api, repo, remote, month, stage_dir):
     return None
 
 
+def run_repair_lineage(doc_ids, work_dir, repo=DEFAULT_REPO):
+    """指定した書類の superseded_by を、系譜の規則で決め直す。
+
+    候補は、解析目録で ok の doc_type=130 の訂正と、対象書類の現在の
+    superseded_by が指す書類 (提出日時は Silver の行から引く) だけとする。
+    規則の解釈を直したときに対象書類の状態を修復するための運用コマンドで、
+    変更があった月だけ parquet を書き換えて上げる。
+    """
+    os.makedirs(work_dir, exist_ok=True)
+    api = HfApi()
+    remote = set(_remote_files(api, repo))
+    parse_ledgers = _fetch_ledgers(api, repo, remote, "parse", work_dir)
+    silver_ledgers = _fetch_ledgers(api, repo, remote, "silver", work_dir)
+    parse_latest = {}
+    for entries in parse_ledgers.values():
+        for e in entries:
+            if e.get("doc_id"):
+                parse_latest[e["doc_id"]] = e
+    doc_month = {}
+    for month, entries in silver_ledgers.items():
+        for e in entries:
+            if e.get("doc_id"):
+                doc_month[e["doc_id"]] = month
+    for doc_id, e in parse_latest.items():
+        if e.get("month"):
+            doc_month[doc_id] = e["month"]
+    known_corrections = {}
+    for doc_id, e in parse_latest.items():
+        if (e.get("status") == "ok" and e.get("doc_type") == "130"
+                and e.get("parent_doc_id")):
+            known_corrections.setdefault(e["parent_doc_id"], {})[doc_id] = \
+                e.get("submit_at")
+
+    stage_dir = os.path.join(work_dir, "stage")
+    os.makedirs(stage_dir, exist_ok=True)
+    tables = {}
+
+    def rows_of(doc_id):
+        month = doc_month.get(doc_id)
+        if not month:
+            return None, None
+        if month not in tables:
+            local = _download_month_silver(api, repo, remote, month,
+                                           stage_dir)
+            if not local:
+                return None, None
+            tables[month] = pq.read_table(local).to_pylist()
+        rows = [r for r in tables[month] if r["doc_id"] == doc_id]
+        return month, rows
+
+    def submit_at_of(doc_id):
+        if doc_id in parse_latest:
+            return parse_latest[doc_id].get("submit_at")
+        _month, rows = rows_of(doc_id)
+        return rows[0]["submit_at"] if rows else None
+
+    summary = {"doc_ids": doc_ids, "repairs": [], "unchanged": [],
+               "not_found": []}
+    dirty_months = set()
+    for doc_id in doc_ids:
+        month, rows = rows_of(doc_id)
+        if not rows:
+            summary["not_found"].append(doc_id)
+            continue
+        current = rows[0].get("superseded_by")
+        cands = dict(known_corrections.get(doc_id) or {})
+        if current and current not in cands:
+            sat = submit_at_of(current)
+            if sat:
+                cands[current] = sat
+        winner = _winner(cands)
+        if winner == current:
+            summary["unchanged"].append(doc_id)
+            continue
+        for r in tables[month]:
+            if r["doc_id"] == doc_id:
+                r["superseded_by"] = winner
+        dirty_months.add(month)
+        summary["repairs"].append(
+            {"doc_id": doc_id, "month": month, "from": current, "to": winner})
+    for month in sorted(dirty_months):
+        out_table = pa.Table.from_pylist(tables[month], schema=SILVER_SCHEMA)
+        out_path = os.path.join(stage_dir, month, "silver.parquet")
+        tmp = out_path + ".tmp"
+        pq.write_table(out_table, tmp)
+        os.replace(tmp, out_path)
+        _upload_file(api, repo, out_path,
+                     f"silver/month={month}/silver.parquet",
+                     f"parse repair-lineage: silver {month}")
+    summary["finished_at"] = _now()
+    return summary
+
+
 # ---------------------------------------------------------------- CLI
 
 def main(argv=None):
@@ -1097,6 +1197,13 @@ def main(argv=None):
     merge.add_argument("--work-dir", required=True)
     merge.add_argument("--repo", default=DEFAULT_REPO)
 
+    repair = sub.add_parser(
+        "repair-lineage", help="指定した書類の superseded_by を決め直す")
+    repair.add_argument("--doc-ids", required=True,
+                        help="対象の書類 ID (カンマ区切り)")
+    repair.add_argument("--work-dir", required=True)
+    repair.add_argument("--repo", default=DEFAULT_REPO)
+
     extract = sub.add_parser(
         "extract-one", help="1書類の zip を解析する (照合・動作確認用)")
     extract.add_argument("--zip", required=True)
@@ -1120,6 +1227,11 @@ def main(argv=None):
     if args.command == "merge":
         result = run_merge(args.plan, args.shards_dir, args.work_dir,
                            repo=args.repo)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.command == "repair-lineage":
+        doc_ids = [d.strip() for d in args.doc_ids.split(",") if d.strip()]
+        result = run_repair_lineage(doc_ids, args.work_dir, repo=args.repo)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     if args.command == "extract-one":

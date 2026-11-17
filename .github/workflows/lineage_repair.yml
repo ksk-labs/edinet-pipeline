@@ -1,0 +1,42 @@
+name: lineage_repair
+
+# 系譜 (superseded_by) の修復 (pipeline.parse repair-lineage)。
+# 系譜の規則の解釈を直したときに、対象書類の superseded_by を
+# 現在の規則で決め直すための運用ワークフロー。通常の日次解析では
+# 使わない (merge が取り込みのつど親の系譜を決め直すため)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      doc_ids:
+        description: "対象の書類 ID (カンマ区切り)"
+        required: true
+        type: string
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Repair lineage
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DOC_IDS: ${{ inputs.doc_ids }}
+        run: |
+          set -euo pipefail
+          python -m pipeline.parse repair-lineage \
+            --doc-ids "$DOC_IDS" \
+            --work-dir work/repair | tee work/repair-summary.json
+      - name: Upload repair evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-repair-evidence
+          path: work/repair-summary.json
+          if-no-files-found: warn
