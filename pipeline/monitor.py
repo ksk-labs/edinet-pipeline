@@ -12,7 +12,10 @@
   場合は、日次報告と状態ファイルの両方でその旨を明示する。
 
 点検は成果物ベースで行うため、ワークフローが起動しなかった・途中で
-落ちた場合は「実行サマリが無い」として検知できる。警報があっても
+落ちた場合は「実行サマリが無い」として検知できる。監視自体が実行
+されなかった日は報告が残らないため、前回の点検対象日 (状態ファイル
+の last_checked_target) との連続性も照合し、点検の抜けた対象日が
+あれば次回以降の報告で警報にする。警報があっても
 監視自体は成功として終わる (終了コードは監視自体の障害でのみ 1)。
 警報の届け先は状態ファイルと日次報告までが仕様 §5 の定めであり、
 それ以外の通知手段は持たない。
@@ -129,6 +132,24 @@ def _judge_acquisition(summaries, prev_acq, target_date):
     return report, state
 
 
+def _unchecked_targets(prev_last_checked, target_date):
+    """前回の点検対象日の翌日から今回の対象日の前日までのうち、点検
+    されていない対象日の一覧を返す。前回の記録が無い場合は空。"""
+    if not prev_last_checked:
+        return []
+    try:
+        day = datetime.fromisoformat(prev_last_checked).date()
+        target = datetime.fromisoformat(target_date).date()
+    except ValueError:
+        return []
+    unchecked = []
+    day += timedelta(days=1)
+    while day < target:
+        unchecked.append(day.isoformat())
+        day += timedelta(days=1)
+    return unchecked
+
+
 def _judge_codelist(api, repo, remote, work_dir, ledger_rows, run_date):
     """コードリストの状態を判定する。戻り値は報告用の dict。"""
     snapshot = _load_json(
@@ -230,6 +251,17 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
                                 target_date)
 
     alerts = []
+    unchecked = _unchecked_targets(prev_acq.get("last_checked_target"),
+                                   target_date)
+    if unchecked:
+        alerts.append({
+            "kind": "monitor_gap",
+            "detail": f"監視が実行されなかったため、対象日 "
+                      f"{', '.join(unchecked)} の取得は点検されて"
+                      "いません (前回の点検対象日は "
+                      f"{prev_acq.get('last_checked_target')} です)",
+            "unchecked_targets": unchecked,
+        })
     if acq_report["status"] == "missing":
         alerts.append({
             "kind": "acquisition_missing",
