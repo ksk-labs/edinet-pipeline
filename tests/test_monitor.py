@@ -80,13 +80,14 @@ class MonitorTestBase(unittest.TestCase):
     def saved_state(self):
         return json.loads(self.store["monitor/state.json"].decode("utf-8"))
 
-    def put_acquisition_ok(self, target_date, failed=0):
+    def put_acquisition_ok(self, target_date, failed=0, stamp=None,
+                           list_count=100):
         month = target_date[:7]
-        stamp = target_date.replace("-", "") + "T000000Z"
+        stamp = stamp or target_date.replace("-", "") + "T000000Z"
         self.put(
             f"acquisition/month={month}/run_summary-{target_date}-{stamp}.json",
             _json_bytes({
-                "date": target_date, "list_count": 100,
+                "date": target_date, "list_count": list_count,
                 "downloaded": 200, "failed": failed,
                 "started_at": f"{target_date}T18:30:00+00:00",
                 "finished_at": f"{target_date}T19:00:00+00:00",
@@ -159,6 +160,102 @@ class AcquisitionFailureTest(MonitorTestBase):
         self.run_monitor("2026-11-17")
         report = self.run_monitor("2026-11-17")
         self.assertEqual(report["acquisition"]["consecutive_failures"], 1)
+
+
+class LatestSummarySelectionTest(MonitorTestBase):
+    """同一対象日に複数の実行サマリがある場合、最新の1件で判定する。
+
+    取得は1日2回 (03:30 と 15:30) の schedule であり、15:30 の回復実行
+    が 03:30 の失敗を上書きすること (およびその逆) が毎日の運転の前提
+    であるため、サマリの選択をテストで固定する。ファイル名の stamp は
+    実行開始時刻 (UTC) で、03:30 JST の実行が 20261116T183000Z、
+    15:30 JST の実行が 20261117T063000Z に対応する。
+    """
+
+    def test_later_ok_overrides_earlier_failure_and_resets_streak(self):
+        self.put_codelist_ok("2026-11-16")
+        report = self.run_monitor("2026-11-16")
+        self.assertEqual(report["acquisition"]["consecutive_failures"], 1)
+
+        self.put_codelist_ok("2026-11-17")
+        self.put_acquisition_ok("2026-11-16", failed=3,
+                                stamp="20261116T183000Z", list_count=90)
+        self.put_acquisition_ok("2026-11-16", failed=0,
+                                stamp="20261117T063000Z", list_count=100)
+        report = self.run_monitor("2026-11-17")
+        acq = report["acquisition"]
+        self.assertEqual(acq["runs"], 2)
+        self.assertEqual(acq["status"], "ok")
+        self.assertEqual(acq["failed"], 0)
+        self.assertEqual(acq["list_count"], 100)
+        self.assertEqual(acq["consecutive_failures"], 0)
+        kinds = [a["kind"] for a in report["alerts"]]
+        self.assertNotIn("acquisition_failures", kinds)
+        state = self.saved_state()
+        self.assertEqual(state["acquisition"]["last_ok_date"], "2026-11-16")
+
+    def test_later_failure_overrides_earlier_ok(self):
+        self.put_codelist_ok("2026-11-17")
+        self.put_acquisition_ok("2026-11-16", failed=0,
+                                stamp="20261116T183000Z", list_count=90)
+        self.put_acquisition_ok("2026-11-16", failed=2,
+                                stamp="20261117T063000Z", list_count=100)
+        report = self.run_monitor("2026-11-17")
+        acq = report["acquisition"]
+        self.assertEqual(acq["runs"], 2)
+        self.assertEqual(acq["status"], "failed")
+        self.assertEqual(acq["failed"], 2)
+        self.assertEqual(acq["list_count"], 100)
+        self.assertEqual(acq["consecutive_failures"], 1)
+        alert = next(a for a in report["alerts"]
+                     if a["kind"] == "acquisition_failures")
+        self.assertEqual(alert["consecutive_failures"], 1)
+
+
+class MonitorGapTest(MonitorTestBase):
+    """前回の点検対象日との連続性を照合し、点検の抜けを警報にする。
+
+    monitor 自体が失敗・未実行だった日は日次報告が残らないため、次回
+    実行時に last_checked_target の飛びからその不在を検知する。
+    """
+
+    def put_healthy(self, run_date, target_date):
+        self.put_acquisition_ok(target_date)
+        self.put_codelist_ok(run_date)
+
+    def test_skipped_days_alert_as_monitor_gap(self):
+        self.put_healthy("2026-11-17", "2026-11-16")
+        self.run_monitor("2026-11-17")
+
+        self.put_healthy("2026-11-20", "2026-11-19")
+        report = self.run_monitor("2026-11-20")
+        kinds = [a["kind"] for a in report["alerts"]]
+        self.assertEqual(kinds, ["monitor_gap"])
+        alert = report["alerts"][0]
+        self.assertEqual(alert["unchecked_targets"],
+                         ["2026-11-17", "2026-11-18"])
+        self.assertIn("monitor_gap", self.saved_state()["open_alerts"])
+        self.assertIn("monitor_gap",
+                      [a["kind"] for a in
+                       self.saved_report("2026-11-20")["alerts"]])
+
+    def test_consecutive_days_have_no_gap(self):
+        for run_date, target_date in [
+                ("2026-11-17", "2026-11-16"),
+                ("2026-11-18", "2026-11-17"),
+                ("2026-11-19", "2026-11-18")]:
+            self.put_healthy(run_date, target_date)
+            report = self.run_monitor(run_date)
+            kinds = [a["kind"] for a in report["alerts"]]
+            self.assertNotIn("monitor_gap", kinds)
+        self.assertEqual(report["alerts"], [])
+
+    def test_same_day_rerun_has_no_gap(self):
+        self.put_healthy("2026-11-17", "2026-11-16")
+        self.run_monitor("2026-11-17")
+        report = self.run_monitor("2026-11-17")
+        kinds = [a["kind"] for a in report["alerts"]]
+        self.assertNotIn("monitor_gap", kinds)
 
 
 class CodelistMissingTest(MonitorTestBase):
