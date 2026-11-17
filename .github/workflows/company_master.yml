@@ -1,0 +1,58 @@
+name: company_master
+
+# 会社マスタと銘柄レイヤー (P2-T3、pipeline.company_master) の運用
+# ワークフロー。v2 データセットの master/ 配下への配置と更新を行う。
+# - place-history: v1 索引から再構成 (P2-T2) を実行し、成果と
+#   最終提出日の集計を master/history_from_v1/ へ配置する。
+#   初期構築の前に1回実行する (再実行は同じ入力からの再生成で冪等)。
+# - build: 初期履歴とコードリストの全スナップショットから会社マスタを
+#   構築し、master/ へ配置する。place-history の後に1回実行する。
+# - update: 現在の master/ へ未適用のスナップショットだけを適用する。
+#   日次の定期実行への配線 (daily_codelist への相乗り) は運用側の
+#   後続作業とし、本ワークフローは手動 dispatch の経路を用意する。
+# 必要な秘密は HF_TOKEN のみ (v1 索引と v2 データセットの読み取りは
+# 公開のため不要)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "実行するコマンド"
+        required: true
+        type: choice
+        options:
+          - place-history
+          - build
+          - update
+
+jobs:
+  company-master:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run company master command
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          COMMAND: ${{ inputs.command }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/master
+          python -m pipeline.company_master "$COMMAND" \
+            --work-dir work/master --upload \
+            | tee work/master/result.json
+      - name: Upload run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: company-master-${{ inputs.command }}-summary
+          path: |
+            work/master/result.json
+            work/master/master_out/summary.json
+            work/master/history_from_v1/summary.json
+          if-no-files-found: warn
