@@ -1075,8 +1075,11 @@ def _download_month_silver(api, repo, remote, month, stage_dir):
 def run_repair_lineage(doc_ids, work_dir, repo=DEFAULT_REPO):
     """指定した書類の superseded_by を、系譜の規則で決め直す。
 
-    候補は、解析目録で ok の doc_type=130 の訂正と、対象書類の現在の
-    superseded_by が指す書類 (提出日時は Silver の行から引く) だけとする。
+    候補は、解析目録で ok の doc_type=130 の訂正だけとする。現在の値が
+    解析目録にある書類を指す場合は、その種別が 130 のときだけ候補に
+    含める (130 でないと分かっている値は、規則に合わない値として
+    外す対象になる)。現在の値が解析目録に無い (バックフィル期の) 書類を
+    指し、候補が1件も無い場合は、判断材料が無いため触らない。
     規則の解釈を直したときに対象書類の状態を修復するための運用コマンドで、
     変更があった月だけ parquet を書き換えて上げる。
     """
@@ -1122,12 +1125,6 @@ def run_repair_lineage(doc_ids, work_dir, repo=DEFAULT_REPO):
         rows = [r for r in tables[month] if r["doc_id"] == doc_id]
         return month, rows
 
-    def submit_at_of(doc_id):
-        if doc_id in parse_latest:
-            return parse_latest[doc_id].get("submit_at")
-        _month, rows = rows_of(doc_id)
-        return rows[0]["submit_at"] if rows else None
-
     summary = {"doc_ids": doc_ids, "repairs": [], "unchanged": [],
                "not_found": []}
     dirty_months = set()
@@ -1138,11 +1135,17 @@ def run_repair_lineage(doc_ids, work_dir, repo=DEFAULT_REPO):
             continue
         current = rows[0].get("superseded_by")
         cands = dict(known_corrections.get(doc_id) or {})
-        if current and current not in cands:
-            sat = submit_at_of(current)
-            if sat:
-                cands[current] = sat
-        winner = _winner(cands)
+        cur_entry = parse_latest.get(current) if current else None
+        if cur_entry is not None and cur_entry.get("doc_type") == "130":
+            cands.setdefault(current, cur_entry.get("submit_at"))
+        if cands:
+            winner = _winner(cands)
+        elif current and cur_entry is not None:
+            # 現在の値が 130 でないと分かっており、候補も無い
+            winner = None
+        else:
+            # 判断材料が無い (バックフィル期の値) ため触らない
+            winner = current
         if winner == current:
             summary["unchanged"].append(doc_id)
             continue
