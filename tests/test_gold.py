@@ -4,11 +4,16 @@
 フリーキャッシュフローの式、増配年数の系列計算 (分割調整を含む)、
 決算期の同定と変則フラグ、配当の期末分の導出を固定する。
 """
+import json
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import pyarrow as pa  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
 
 from pipeline import gold  # noqa: E402
 
@@ -181,6 +186,30 @@ class WinnerResolutionTest(unittest.TestCase):
         _, stats = gold.resolve_winners(facts, DOC_MAP, CODE_TO_ID)
         self.assertEqual(stats["unresolved_docs"], 1)
 
+    def test_same_submit_at_correction_tie_goes_to_larger_doc_id(self):
+        # S-1: 同一 submit_at の訂正2件では、系譜 (build_doc_lineage) と
+        # 同じく doc_id の大きい方を勝者とする
+        doc_map = dict(DOC_MAP)
+        for doc_id in ("D1A", "D1B"):
+            doc_map[doc_id] = {"edinet_code": "E00001", "doc_type": "130",
+                               "standard": "japan_gaap",
+                               "submit_at": "2026-07-01 10:00",
+                               "period_start": "2025-04-01",
+                               "period_end": "2026-03-31"}
+        facts = [
+            fact("D1A", "jpcrp_cor:NetSalesSummaryOfBusinessResults", 120.0,
+                 "2025-04-01", "2026-03-31", pit="final",
+                 submit_at="2026-07-01 10:00", seq=0),
+            fact("D1B", "jpcrp_cor:NetSalesSummaryOfBusinessResults", 130.0,
+                 "2025-04-01", "2026-03-31", pit="final",
+                 submit_at="2026-07-01 10:00", seq=1),
+        ]
+        winners, _ = gold.resolve_winners(facts, doc_map, CODE_TO_ID)
+        key = (1, "jpcrp_cor:NetSalesSummaryOfBusinessResults",
+               "2025-04-01", "2026-03-31", gold.CONSOLIDATED, "iso4217:JPY")
+        self.assertEqual(winners[key]["value"], 130.0)
+        self.assertEqual(winners[key]["doc_id"], "D1B")
+
 
 class BuildTest(unittest.TestCase):
     def setUp(self):
@@ -256,6 +285,29 @@ class BuildTest(unittest.TestCase):
         row = tables["annual"].to_pylist()[0]
         self.assertEqual(row["period_months"], 15)
         self.assertTrue(row["is_irregular"])
+
+    def test_source_doc_is_latest_submission(self):
+        # S-2: 代表書類はその期間の書類のうち提出日時が最大のもの
+        doc_map = {
+            "D1": {"edinet_code": "E00001", "doc_type": "120",
+                   "standard": "japan_gaap", "submit_at": "2026-06-01 10:00",
+                   "period_start": "2025-04-01",
+                   "period_end": "2026-03-31"},
+            "D2": {"edinet_code": "E00001", "doc_type": "120",
+                   "standard": "japan_gaap", "submit_at": "2026-07-01 10:00",
+                   "period_start": "2025-04-01",
+                   "period_end": "2026-03-31"},
+        }
+        facts = [
+            fact("D1", "jpcrp_cor:NetSalesSummaryOfBusinessResults", 1000.0,
+                 "2025-04-01", "2026-03-31", seq=0),
+        ]
+        winners = winners_for(facts)
+        tables, _ = gold.generate(
+            self.registry, winners, doc_map, CODE_TO_ID, {1: "上場"}, {},
+            {}, "2026-11-17T00:00:00+00:00")
+        row = tables["annual"].to_pylist()[0]
+        self.assertEqual(row["source_doc_id"], "D2")
 
 
 class DividendSeriesTest(unittest.TestCase):
@@ -411,6 +463,80 @@ class QuarterlyExclusionTest(unittest.TestCase):
         self.assertEqual(len(qrows), 1)
         self.assertEqual(qrows[0]["period_end"], "2026-09-30")
         self.assertEqual(qrows[0]["period_months"], 6)
+
+
+class UpdateWatermarkTest(unittest.TestCase):
+    """MF-1: 透かしの内容ハッシュによる値だけの書き換えの検出。"""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.registry_path = os.path.join(self.tmp, "indicators.yaml")
+        with open(self.registry_path, "w", encoding="utf-8") as f:
+            f.write(REGISTRY_YAML)
+        self.silver_dir = os.path.join(self.tmp, "silver")
+        self.master_dir = os.path.join(self.tmp, "master")
+        self.catalog_dir = os.path.join(self.tmp, "catalog")
+        self.work_dir = os.path.join(self.tmp, "work")
+        os.makedirs(os.path.join(self.silver_dir, "month=2026-06"))
+        os.makedirs(self.master_dir)
+        os.makedirs(os.path.join(self.catalog_dir, "month=2026-06"))
+        pq.write_table(
+            pa.table({"edinet_code": ["E00001"], "internal_id": [1]}),
+            os.path.join(self.master_dir, "edinet_codes.parquet"))
+        with open(os.path.join(self.catalog_dir, "month=2026-06",
+                               "ledger.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"docID": "D1", "edinetCode": "E00001", "docTypeCode": "120",
+                 "submitDateTime": "2026-06-01 10:00",
+                 "periodStart": "2025-04-01",
+                 "periodEnd": "2026-03-31"}, ensure_ascii=False) + "\n")
+
+    def _write_silver(self, value):
+        table = pa.table({
+            "doc_id": ["D1"],
+            "element": ["jpcrp_cor:NetSalesSummaryOfBusinessResults"],
+            "value": [float(value)],
+            "unit": ["iso4217:JPY"],
+            "context_start": ["2025-04-01"],
+            "context_end": ["2026-03-31"],
+            "dimension": [""],
+            "submit_at": ["2026-06-01 10:00"],
+            "point_in_time": ["as_filed"],
+        })
+        pq.write_table(
+            table,
+            os.path.join(self.silver_dir, "month=2026-06", "silver.parquet"))
+
+    def _args(self, command):
+        return SimpleNamespace(
+            command=command, work_dir=self.work_dir, upload=False,
+            since_month="2021-11", silver_dir=self.silver_dir,
+            master_dir=self.master_dir, catalog_dir=self.catalog_dir,
+            index=None, registry=self.registry_path)
+
+    def test_value_only_rewrite_is_detected(self):
+        # build (net_sales 1000) した後、Silver を同行数・同最大提出日時
+        # のまま 2000 に書き換えて update すると、その月が変化として
+        # 検出され、annual の値が 2000 に更新される
+        self._write_silver(1000.0)
+        gold.cmd_build(self._args("build"))
+        annual = pq.read_table(
+            os.path.join(self.work_dir, "gold", "annual.parquet"))
+        self.assertEqual(annual.to_pylist()[0]["net_sales"], 1000.0)
+        self._write_silver(2000.0)
+        result = gold.cmd_update(self._args("update"))
+        self.assertEqual(result["changed_months"], ["2026-06"])
+        annual = pq.read_table(
+            os.path.join(self.work_dir, "gold", "annual.parquet"))
+        self.assertEqual(annual.to_pylist()[0]["net_sales"], 2000.0)
+
+    def test_unchanged_silver_is_not_changed(self):
+        self._write_silver(1000.0)
+        gold.cmd_build(self._args("build"))
+        result = gold.cmd_update(self._args("update"))
+        self.assertEqual(result["changed_months"], [])
+        self.assertEqual(result["note"], "no changes")
 
 
 if __name__ == "__main__":

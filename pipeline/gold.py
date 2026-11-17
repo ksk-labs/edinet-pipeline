@@ -24,7 +24,9 @@ gold/ への追加分 (本モジュールが正本):
 - summary.json: 生成統計 (行数、指標ごとの充足、未解決の書類数、
   登録簿の版と sha256、スナップショット日)。
 - state.json: 日次差分 (update) のための透かし (月ごとの行数と
-  最大提出日時、登録簿の sha256)。
+  最大提出日時と内容ハッシュ、登録簿の sha256)。内容ハッシュは
+  行数と最大提出日時が変わらない値だけの書き換え (既存書類の
+  再解析) も検出するために持つ。
 - snapshots/date=YYYY-MM-DD/: 日次スナップショットとしての版固定の
   複写 (仕様 §9、台帳 D14)。build / update のたびに当日の一式を置く。
 
@@ -339,7 +341,11 @@ def resolve_winners(facts, doc_map, code_to_id):
     """確定値の勝者を決める。
 
     キーは (internal_id, element, context_start, context_end, 区分, unit)。
-    優先順は final (訂正由来) -> 提出日時の新しいもの -> 格納順の早いもの。
+    優先順は final (訂正由来) -> 提出日時の新しいもの -> doc_id の
+    大きいもの -> 格納順の早いもの。doc_id の決め手は系譜
+    (build_doc_lineage) と同じ順序 (提出日時、次に doc_id) に揃えて
+    あり、同一分の訂正が複数ある場合に勝者と latest_correction_doc_id
+    が食い違わないようにする。
     戻り値: (winners, stats)。winners の値は事実 dict に internal_id と
     dim_class を加えたもの。
     """
@@ -372,8 +378,10 @@ def resolve_winners(facts, doc_map, code_to_id):
     winners = {}
     for key, cands in by_key.items():
         ordered = sorted(cands, key=lambda c: c["seq"])
-        ordered = sorted(ordered, key=lambda c: c["submit_at"] or "",
-                         reverse=True)
+        ordered = sorted(
+            ordered,
+            key=lambda c: (c["submit_at"] or "", c["doc_id"]),
+            reverse=True)
         ordered = sorted(
             ordered, key=lambda c: 0 if c["point_in_time"] == "final" else 1)
         winner = ordered[0]
@@ -971,7 +979,14 @@ def generate(registry, winners, doc_map, code_to_id, listing_status,
             row["accounting_standard"] = row.pop("_standard")
             docs = builder.annual_docs.get(
                 (internal_id, row["period_start"], row["period_end"]), [])
-            source_doc = docs[0] if docs else None
+            source_doc = None
+            if docs:
+                # 代表書類はその期間の書類のうち提出日時が最大のもの
+                # (挿入順の docs[0] では恣意的な選択になるため)
+                source_doc = max(
+                    docs,
+                    key=lambda d: (doc_map.get(d) or {}).get("submit_at")
+                    or "")
             if source_doc is None:
                 for ind in registry["indicators"]:
                     for b in builder.basis_rows:
@@ -1047,12 +1062,22 @@ def _to_table(rows, schema):
 
 
 def month_watermark(silver_dir, month):
-    """月の透かし (行数と最大提出日時)。update の変化検出に使う。"""
+    """月の透かし (行数・最大提出日時・内容ハッシュ)。update の変化検出に使う。
+
+    内容ハッシュ (sha256) は、行数と最大提出日時が変わらない
+    値だけの書き換え (既存書類の再解析) も検出するために持つ。
+    ファイルサイズだけでは不十分なため、バイト列のハッシュとする。
+    """
     path = os.path.join(silver_dir, f"month={month}", "silver.parquet")
     rows = pq.read_metadata(path).num_rows
     table = pq.read_table(path, columns=["submit_at"])
     values = table.column("submit_at").to_pylist()
-    return {"rows": rows, "max_submit_at": max(values) if values else None}
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"rows": rows, "max_submit_at": max(values) if values else None,
+            "sha256": digest.hexdigest()}
 
 
 def fetch_inputs(work_dir, months):
