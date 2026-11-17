@@ -39,7 +39,11 @@ jppfs_cor:CashAndDeposits) で、Silver の element 列と同じ形にする。
 - taxonomy/ledger.jsonl: 実行ごとの結果の追記目録
 
 年次更新は完全自動とする: 検出 (月次確認+11月の重点確認) → 取込 →
-差分報告 → 未知要素の隔離と警報。ただし指標に効く要素の改名・分割・
+差分報告 → 未知要素の隔離と警報。未知要素の隔離は Silver の要素一覧
+が渡された場合に行うもので、年次ワークフローへの配線
+(--silver-elements) は Silver 側の接続点 (S2-T5) の確定待ちであり、
+現行の年次ワークフローでは隔離は未実施である (到達点は作業記録に
+明記)。ただし指標に効く要素の改名・分割・
 削除・意味変更の判断はユーザーの判断事項であり、自動では行わない。
 該当する差分は judgment_items として警報に上げ、確定までは旧対応で
 運転を継続する (本モジュールは指標登録簿を変更しない)。
@@ -48,8 +52,9 @@ arelle の追随確認: arelle の EDINET 専用プラグインの有効一覧
 (plugin/validate/EDINET/resources/edinet-taxonomies.xml) が、取り込んだ
 タクソノミの名前空間日付をすべて含むかを確認する。旧版の日付が一覧に
 無いと制度選択時に事実が欠落するため (2026-11-17 実測)、新しい日付が
-一覧に無い場合は警報にする。確認対象は、インストール済み arelle の
-同梱ファイル (あれば) と上流 (Arelle/Arelle の master) の両方。
+一覧に無い場合は警報にする。確認対象はインストール済み arelle の
+同梱ファイルを優先し、無ければ上流 (Arelle/Arelle の master) を使う
+(先勝ちであり、両方の突合はしない)。
 
 証券コード協議会の取扱い要領の継続確認: JPX の証券コード協議会
 「関係資料等」ページから取扱い要領 PDF (codestock_<日付>.pdf) を
@@ -401,8 +406,13 @@ def parse_taxonomy_zip(zip_bytes):
 
 # ---------------------------------------------------------------- 差分
 
+# 意味変更の判定項目。namespace はタクソノミ日付を含むため、項目に
+# 入れると日付のみの繰り上がり (date_only) と分離できなくなるので
+# 対象外とする。substitution_group と element_id は日付を含まず、
+# XBRL 上の意味・同一性に効くため判定項目に含める。
 _SEMANTIC_FIELDS = ("label_ja", "label_en", "type", "period_type",
-                    "balance", "abstract", "deprecated")
+                    "balance", "abstract", "deprecated",
+                    "substitution_group", "element_id")
 
 
 def compute_diff(old, new, indicator_elements=()):
@@ -586,7 +596,7 @@ def arelle_date_report(taxonomy_dates, arelle_info):
 
 
 def load_arelle_taxonomies(fetcher=None):
-    """arelle の有効一覧を取得する (同梱ファイル優先、上流で補完)。
+    """arelle の有効一覧を取得する (同梱ファイル優先、無ければ上流)。
 
     戻り値: (info, source)。同梱も上流も取れない場合は (None, None)。
     """
@@ -634,6 +644,7 @@ def edition_paths(edition):
 
 
 _EDITION_PATH_RE = re.compile(r"^taxonomy/edition=(\d+)/elements\.jsonl$")
+_EDITION_META_RE = re.compile(r"^taxonomy/edition=(\d+)/meta\.json$")
 
 
 def _remote_files(api, repo):
@@ -707,6 +718,118 @@ def _previous_edition(remote, edition):
     return editions[-1] if editions else None
 
 
+def _remote_bytes(api, repo, path_in_repo, work_dir, name):
+    local = os.path.join(work_dir, "state", name)
+    if not _download_if_exists(api, repo, path_in_repo, local):
+        return None
+    with open(local, "rb") as f:
+        return f.read()
+
+
+def _complete_diff(api, repo, work_dir, summary, edition, elements,
+                   remote, fetched_at, indicator_elements):
+    """差分 (diff.json と changes.jsonl) を生成して保存する。
+
+    codelist の _complete_diff と同じ流儀とする。両方そろっていれば
+    present、不足していれば直前版から生成して補完し (already_present
+    の再実行でも不足分はここで生成される)、生成できなければ例外に
+    せず pending として返す。戻り値の dict は status (present /
+    generated / pending / no_base) と base_edition を持ち、generated
+    のときは counts と judgment_items、pending のときは error を
+    持つ。保存したパスは summary["uploaded"] へ追記する。
+    """
+    paths = edition_paths(edition)
+    result = {"status": "no_base",
+              "base_edition": _previous_edition(remote, edition)}
+    if result["base_edition"] is None:
+        return result
+    if paths["diff"] in remote and paths["changes"] in remote:
+        result["status"] = "present"
+        return result
+    try:
+        old = _read_remote_elements(api, repo, result["base_edition"],
+                                    work_dir)
+        if old is None:
+            raise TaxonomyError("直前版の要素辞書を取得できませんでした")
+        diff = compute_diff(old, elements, indicator_elements)
+        diff_doc = {
+            "edition": edition, "base_edition": result["base_edition"],
+            "generated_at": _now(), "counts": diff["counts"],
+            "rename_candidates": diff["rename_candidates"],
+            "split_candidates": diff["split_candidates"],
+            "judgment_items": diff["judgment_items"],
+            "source": SOURCE_LIST, "fetched_at": fetched_at,
+            "redistribution": REDISTRIBUTION,
+        }
+        changes_text = "".join(
+            json.dumps(row, ensure_ascii=False) + "\n"
+            for row in changes_rows(diff))
+        for repo_path, data, message in [
+                (paths["diff"],
+                 json.dumps(diff_doc, ensure_ascii=False, indent=2),
+                 f"taxonomy {edition}: diff summary"),
+                (paths["changes"], changes_text,
+                 f"taxonomy {edition}: diff changes")]:
+            if repo_path in remote:
+                continue
+            local = os.path.join(work_dir, "stage", repo_path)
+            _write_local(local, data)
+            _upload_file(api, repo, local, repo_path, message)
+            summary["uploaded"].append(repo_path)
+            remote.add(repo_path)
+    except Exception as e:
+        result["status"] = "pending"
+        result["error"] = f"{type(e).__name__}: {e}"[:500]
+        return result
+    result["status"] = "generated"
+    result["counts"] = diff["counts"]
+    result["judgment_items"] = diff["judgment_items"]
+    return result
+
+
+def _apply_diff_result(summary, edition, dres):
+    """_complete_diff の結果を summary と警報へ反映する。"""
+    summary["diff_status"] = dres["status"]
+    summary["diff_base_edition"] = dres["base_edition"]
+    if dres.get("counts"):
+        summary["diff_counts"] = dres["counts"]
+    if dres.get("error"):
+        summary["diff_error"] = dres["error"]
+    if dres.get("judgment_items"):
+        summary["alerts"].append({
+            "kind": "judgment_required",
+            "items": dres["judgment_items"],
+            "note": "指標に効く要素の差分。意味判断はユーザーの"
+                    "判断事項であり、確定までは旧対応で継続する"})
+    if dres["status"] == "pending":
+        summary["alerts"].append({
+            "kind": "diff_pending", "edition": edition,
+            "error": dres.get("error"),
+            "note": "差分が未生成です。次回の取込実行で補完されます"})
+
+
+def _apply_arelle_check(summary, taxonomy_dates):
+    """取込時の arelle 追随確認を summary と警報へ反映する。
+
+    有効一覧の取得自体が失敗した場合も、無言で通さず警報にする
+    (run_check 側の failed_sources と対称にする)。
+    """
+    arelle_info, arelle_source = load_arelle_taxonomies()
+    if arelle_info is None:
+        summary["arelle_error"] = "有効一覧を取得できませんでした"
+        summary["alerts"].append({
+            "kind": "arelle_unavailable",
+            "note": "arelle の有効一覧を取得できず、追随確認が"
+                    "できませんでした"})
+        return
+    coverage = arelle_date_report(taxonomy_dates, arelle_info)
+    summary["arelle"] = {**coverage, "source": arelle_source}
+    if not coverage["ok"]:
+        summary["alerts"].append({
+            "kind": "arelle_not_following",
+            "missing_dates": coverage["missing"]})
+
+
 # ---------------------------------------------------------------- 確認 (check)
 
 def run_check(work_dir, repo=DEFAULT_REPO, fetcher=None, save_state=True):
@@ -715,8 +838,12 @@ def run_check(work_dir, repo=DEFAULT_REPO, fetcher=None, save_state=True):
     一覧ページ・ポータル・取扱い要領・arelle の4経路を確認し、前回の
     状態 (taxonomy/state.json) と比較する。取得に失敗した経路は
     failed_sources に記録し、他の経路の確認は続ける (部分失敗の隔離)。
-    新版の検出は一覧ページの最新版が保存済みの最新版より新しいことで
-    判定し、ポータルの最新 ALL 日付との不整合も警報にする。
+    新版の検出は「一覧ページの最新版がまだ取り込まれていないこと」で
+    判定する (取込済みの証拠は state の ingested_editions とリモートの
+    版ごとの meta の有無)。state の latest_edition は最後に見た版の
+    記録にすぎず検出の判定には使わないため、確認のみの実行や取込の
+    失敗で検出が消費されることはない。ポータルの最新 ALL 日付との
+    不整合も警報にする。
     """
     fetcher = fetcher or fetch_url
     os.makedirs(os.path.join(work_dir, "state"), exist_ok=True)
@@ -731,6 +858,15 @@ def run_check(work_dir, repo=DEFAULT_REPO, fetcher=None, save_state=True):
     }
     state = _read_remote_json(api, repo, "taxonomy/state.json",
                               work_dir, "taxonomy-state.json") or {}
+    ingested = set(state.get("ingested_editions") or [])
+    try:
+        for path in _remote_files(api, repo):
+            m = _EDITION_META_RE.match(path)
+            if m:
+                ingested.add(int(m.group(1)))
+    except Exception:
+        pass
+    result["ingested_editions"] = sorted(ingested)
 
     try:
         html = fetcher(LIST_PAGE_URL).decode("utf-8", errors="replace")
@@ -747,8 +883,7 @@ def run_check(work_dir, repo=DEFAULT_REPO, fetcher=None, save_state=True):
             "source": SOURCE_LIST, "source_id": LIST_PAGE_URL,
             "fetched_at": checked_at, "redistribution": REDISTRIBUTION,
         }
-        known = state.get("latest_edition")
-        if known is None or latest["edition"] > known:
+        if latest["edition"] not in ingested:
             result["new_edition"] = latest
             result["alerts"].append({
                 "kind": "new_edition", "edition": latest["edition"],
@@ -761,6 +896,9 @@ def run_check(work_dir, repo=DEFAULT_REPO, fetcher=None, save_state=True):
     try:
         html = fetcher(PORTAL_URL).decode("utf-8", errors="replace")
         portal = parse_portal_page(html)
+        if not portal["files"] or not portal["newest_all_date"]:
+            raise TaxonomyError(
+                "ポータルから配布ファイルを抽出できませんでした")
         result["portal"] = {
             **portal, "sha256": sha256_bytes(html.encode("utf-8")),
             "source": SOURCE_PORTAL, "source_id": PORTAL_URL,
@@ -832,10 +970,12 @@ def run_check(work_dir, repo=DEFAULT_REPO, fetcher=None, save_state=True):
                 "sha256", state.get("list_page_sha256")),
             "portal_newest_all_date": (result["portal"] or {}).get(
                 "newest_all_date", state.get("portal_newest_all_date")),
+            "portal_sha256": (result["portal"] or {}).get(
+                "sha256", state.get("portal_sha256")),
             "council": result["council"] or state.get("council"),
             "arelle": result["arelle"] or state.get("arelle"),
             "required_taxonomy_dates": state.get("required_taxonomy_dates"),
-            "ingested_editions": state.get("ingested_editions") or [],
+            "ingested_editions": sorted(ingested),
         }
         result["state"] = new_state
         local = os.path.join(work_dir, "state", "taxonomy-state-new.json")
@@ -858,8 +998,12 @@ def run_ingest(work_dir, edition, zip_bytes, published=None, zip_url=None,
 
     同じ版が同じ ZIP ハッシュで保存済みなら already_present (冪等)。
     同じ版で異なるハッシュなら conflict として記録し、先に保存された
-    ものを正とする (codelist と同じ扱い)。差分の生成は本体の保存に
-    従属し、失敗しても本体の保存は成功として記録する。
+    ものを正とする (codelist と同じ扱い)。競合の判定は meta の ZIP
+    ハッシュだけでなく、保存済みの要素辞書自体のハッシュでも行う
+    (elements だけが先行保存された部分状態で、別内容の辞書と新内容の
+    meta が組み合わさる食い違いを防ぐため)。差分の生成は本体の保存に
+    従属し、失敗しても本体の保存は成功として記録するが、未生成
+    (pending) は警報と目録に残し、次回の実行が不足分を補完する。
     """
     api = HfApi()
     stage_dir = os.path.join(work_dir, "stage")
@@ -880,22 +1024,56 @@ def run_ingest(work_dir, edition, zip_bytes, published=None, zip_url=None,
     summary["sha256_zip"] = sha256_bytes(zip_bytes)
     paths = edition_paths(edition)
     remote = _remote_files(api, repo)
+    elements_text = "".join(
+        json.dumps(elements[key], ensure_ascii=False) + "\n"
+        for key in sorted(elements))
+    summary["sha256_elements"] = sha256_bytes(
+        elements_text.encode("utf-8"))
+
+    def _elements_conflict():
+        """保存済みの要素辞書と今回の辞書のハッシュが食い違うか。"""
+        if paths["elements"] not in remote:
+            return False
+        existing_bytes = _remote_bytes(api, repo, paths["elements"],
+                                       work_dir, f"elements-{edition}.jsonl")
+        if existing_bytes is None:
+            return False
+        existing_sha = sha256_bytes(existing_bytes)
+        if existing_sha == summary["sha256_elements"]:
+            return False
+        summary["existing_sha256_elements"] = existing_sha
+        return True
 
     if paths["meta"] in remote:
         existing = _read_remote_json(api, repo, paths["meta"], work_dir,
                                      f"meta-{edition}.json") or {}
-        if existing.get("sha256_zip") == summary["sha256_zip"]:
-            summary["status"] = "already_present"
+        if existing.get("sha256_zip") != summary["sha256_zip"] \
+                or _elements_conflict():
+            summary["status"] = "conflict"
+            summary["existing_sha256_zip"] = existing.get("sha256_zip")
             _finish_ingest(api, repo, work_dir, summary)
             return summary
+        summary["status"] = "already_present"
+        dres = _complete_diff(api, repo, work_dir, summary, edition,
+                              elements, remote, fetched_at,
+                              indicator_elements)
+        _apply_diff_result(summary, edition, dres)
+        _apply_arelle_check(summary, parsed["taxonomy_dates"])
+        _finish_ingest(api, repo, work_dir, summary)
+        return summary
+
+    if _elements_conflict():
+        # meta が無いのに要素辞書だけが別内容で保存されている部分状態。
+        # meta だけを新内容で書くと辞書と出所が食い違うため競合にする。
         summary["status"] = "conflict"
-        summary["existing_sha256_zip"] = existing.get("sha256_zip")
+        summary["conflict_note"] = "elements_only_partial_state"
         _finish_ingest(api, repo, work_dir, summary)
         return summary
 
     meta = {
         "edition": edition, "published": published,
         "zip_url": zip_url, "sha256_zip": summary["sha256_zip"],
+        "sha256_elements": summary["sha256_elements"],
         "element_count": len(elements),
         "taxonomy_dates": parsed["taxonomy_dates"],
         "schema_count": parsed["schema_count"],
@@ -903,9 +1081,6 @@ def run_ingest(work_dir, edition, zip_bytes, published=None, zip_url=None,
         "source": SOURCE_LIST, "source_id": zip_url or LIST_PAGE_URL,
         "fetched_at": fetched_at, "redistribution": REDISTRIBUTION,
     }
-    elements_text = "".join(
-        json.dumps(elements[key], ensure_ascii=False) + "\n"
-        for key in sorted(elements))
     products = [
         (paths["archive"], zip_bytes,
          f"taxonomy {edition}: original zip (archive)"),
@@ -923,76 +1098,36 @@ def run_ingest(work_dir, edition, zip_bytes, published=None, zip_url=None,
         summary["uploaded"].append(repo_path)
         remote.add(repo_path)
 
-    # 差分 (直前版との比較)。従属工程として失敗を隔離する。
-    base_edition = _previous_edition(remote, edition)
-    summary["diff_base_edition"] = base_edition
-    if base_edition is not None:
-        try:
-            old = _read_remote_elements(api, repo, base_edition, work_dir)
-            diff = compute_diff(old, elements, indicator_elements)
-            summary["diff_counts"] = diff["counts"]
-            diff_doc = {
-                "edition": edition, "base_edition": base_edition,
-                "generated_at": _now(), "counts": diff["counts"],
-                "rename_candidates": diff["rename_candidates"],
-                "split_candidates": diff["split_candidates"],
-                "judgment_items": diff["judgment_items"],
-                "source": SOURCE_LIST, "fetched_at": fetched_at,
-                "redistribution": REDISTRIBUTION,
-            }
-            changes_text = "".join(
-                json.dumps(row, ensure_ascii=False) + "\n"
-                for row in changes_rows(diff))
-            for repo_path, data, message in [
-                    (paths["diff"],
-                     json.dumps(diff_doc, ensure_ascii=False, indent=2),
-                     f"taxonomy {edition}: diff summary"),
-                    (paths["changes"], changes_text,
-                     f"taxonomy {edition}: diff changes")]:
-                if repo_path in remote:
-                    continue
-                local = os.path.join(stage_dir, repo_path)
-                _write_local(local, data)
-                _upload_file(api, repo, local, repo_path, message)
-                summary["uploaded"].append(repo_path)
-            if diff["judgment_items"]:
-                summary["alerts"].append({
-                    "kind": "judgment_required",
-                    "items": diff["judgment_items"],
-                    "note": "指標に効く要素の差分。意味判断はユーザーの"
-                            "判断事項であり、確定までは旧対応で継続する"})
-        except Exception as e:
-            summary["diff_status"] = "pending"
-            summary["diff_error"] = f"{type(e).__name__}: {e}"[:500]
+    # 差分 (直前版との比較)。従属工程として失敗を隔離し、未生成は
+    # 警報と目録に残して次回の実行で補完する。
+    dres = _complete_diff(api, repo, work_dir, summary, edition,
+                          elements, remote, fetched_at,
+                          indicator_elements)
+    _apply_diff_result(summary, edition, dres)
 
     # 未知要素の隔離 (Silver の要素一覧が与えられた場合)。
     if silver_elements is not None:
         unknown = find_unknown(silver_elements, elements)
         summary["unknown_elements"] = unknown
         if unknown:
-            quarantine_text = "".join(
-                json.dumps({"element": el, "edition": edition,
-                            "detected_at": fetched_at,
-                            "source": "silver_elements"},
-                           ensure_ascii=False) + "\n" for el in unknown)
-            local = os.path.join(stage_dir, paths["quarantine"])
-            _write_local(local, quarantine_text)
-            _upload_file(api, repo, local, paths["quarantine"],
-                         f"taxonomy {edition}: unknown elements quarantine")
-            summary["uploaded"].append(paths["quarantine"])
             summary["alerts"].append({
                 "kind": "unknown_elements", "count": len(unknown),
                 "elements": unknown})
+            if paths["quarantine"] not in remote:
+                quarantine_text = "".join(
+                    json.dumps({"element": el, "edition": edition,
+                                "detected_at": fetched_at,
+                                "source": "silver_elements"},
+                               ensure_ascii=False) + "\n" for el in unknown)
+                local = os.path.join(stage_dir, paths["quarantine"])
+                _write_local(local, quarantine_text)
+                _upload_file(api, repo, local, paths["quarantine"],
+                             f"taxonomy {edition}: unknown elements quarantine")
+                summary["uploaded"].append(paths["quarantine"])
+                remote.add(paths["quarantine"])
 
     # arelle の追随確認 (取り込んだ版の日付で)。
-    arelle_info, arelle_source = load_arelle_taxonomies()
-    if arelle_info is not None:
-        coverage = arelle_date_report(parsed["taxonomy_dates"], arelle_info)
-        summary["arelle"] = {**coverage, "source": arelle_source}
-        if not coverage["ok"]:
-            summary["alerts"].append({
-                "kind": "arelle_not_following",
-                "missing_dates": coverage["missing"]})
+    _apply_arelle_check(summary, parsed["taxonomy_dates"])
     summary["status"] = "ok"
     _finish_ingest(api, repo, work_dir, summary)
     return summary
@@ -1005,9 +1140,12 @@ def _finish_ingest(api, repo, work_dir, summary):
         "status": summary["status"], "fetched_at": summary["fetched_at"],
         "sha256_zip": summary.get("sha256_zip"),
         "element_count": summary.get("element_count"),
+        "diff_status": summary.get("diff_status"),
         "alerts": summary.get("alerts"),
         "source": SOURCE_LIST, "redistribution": REDISTRIBUTION,
     }
+    if summary.get("diff_error"):
+        row["diff_error"] = summary["diff_error"]
     try:
         _append_ledger(api, repo, work_dir, row)
     except Exception as e:
@@ -1024,8 +1162,10 @@ def run_all(work_dir, repo=DEFAULT_REPO, indicator_elements=(),
             silver_elements=None, fetcher=None):
     """確認→新版があれば取込までを一括で行う (ワークフローの入口)。
 
-    取込後は state の required_taxonomy_dates と ingested_editions を
-    更新し、arelle の追随を再確認する。
+    取込が成功 (ok / already_present) した場合だけ state の
+    required_taxonomy_dates と ingested_editions を更新する。ZIP の
+    取得や取込が失敗した場合は例外として表面化し、取込済み状態は
+    進まないため、次回の実行で検出・取込が再試行される。
     """
     fetcher = fetcher or fetch_url
     check = run_check(work_dir, repo=repo, fetcher=fetcher)
@@ -1040,20 +1180,21 @@ def run_all(work_dir, repo=DEFAULT_REPO, indicator_elements=(),
             indicator_elements=indicator_elements,
             silver_elements=silver_elements)
         summary["ingest"] = ingest
-        # state の更新 (取り込んだ版と必要な日付)。
-        api = HfApi()
-        state = _read_remote_json(api, repo, "taxonomy/state.json",
-                                  work_dir, "taxonomy-state.json") or {}
-        ingested = sorted(set((state.get("ingested_editions") or [])
-                              + [new_edition["edition"]]))
-        state["ingested_editions"] = ingested
-        dates = ingest.get("taxonomy_dates") or []
-        state["required_taxonomy_dates"] = [max(dates)] if dates else []
-        state["ingested_taxonomy_dates"] = dates
-        local = os.path.join(work_dir, "state", "taxonomy-state-new.json")
-        _write_local(local, json.dumps(state, ensure_ascii=False, indent=2))
-        _upload_file(api, repo, local, "taxonomy/state.json",
-                     f"taxonomy {new_edition['edition']}: state after ingest")
+        if ingest.get("status") in ("ok", "already_present"):
+            # state の更新 (取り込んだ版と必要な日付)。
+            api = HfApi()
+            state = _read_remote_json(api, repo, "taxonomy/state.json",
+                                      work_dir, "taxonomy-state.json") or {}
+            ingested = sorted(set((state.get("ingested_editions") or [])
+                                  + [new_edition["edition"]]))
+            state["ingested_editions"] = ingested
+            dates = ingest.get("taxonomy_dates") or []
+            state["required_taxonomy_dates"] = [max(dates)] if dates else []
+            state["ingested_taxonomy_dates"] = dates
+            local = os.path.join(work_dir, "state", "taxonomy-state-new.json")
+            _write_local(local, json.dumps(state, ensure_ascii=False, indent=2))
+            _upload_file(api, repo, local, "taxonomy/state.json",
+                         f"taxonomy {new_edition['edition']}: state after ingest")
     summary_path = os.path.join(work_dir, "out", "run_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
