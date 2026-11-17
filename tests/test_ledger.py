@@ -10,6 +10,7 @@ pipeline.ledger.JsonlLedger の特殊形になった。ここでは統合前の�
 - バックフィル経路の回帰: run_batch の処理済み判定と combine が、
   統合後の Ledger でも従来どおり動くこと (小さな合成ジョブで確認)
 """
+import hashlib
 import io
 import json
 import os
@@ -17,6 +18,8 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+
+import pyarrow.parquet as pq
 
 from pipeline.batch import Ledger, combine, run_batch
 from pipeline.discovery import JsonlLedger as DiscoveryLedger
@@ -119,9 +122,35 @@ def _make_doc_zip():
     return buf.getvalue()
 
 
+def _make_valid_doc_zip():
+    xbrl = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<xbrl xmlns="http://www.xbrl.org/2003/instance" '
+        'xmlns:jppfs="http://disclosure.edinet-fsa.go.jp/taxonomy/jppfs/'
+        '2024-11-01/jppfs_cor" '
+        'xmlns:iso4217="http://www.xbrl.org/2003/iso4217">'
+        '<context id="CurrentYearDuration"><entity>'
+        '<identifier scheme="http://disclosure.edinet-fsa.go.jp">E00001'
+        '</identifier></entity><period>'
+        '<startDate>2015-04-01</startDate><endDate>2016-03-31</endDate>'
+        '</period></context>'
+        '<unit id="JPY"><measure>iso4217:JPY</measure></unit>'
+        '<jppfs:NetSales contextRef="CurrentYearDuration" unitRef="JPY" '
+        'decimals="0" scale="6">123</jppfs:NetSales>'
+        '<jppfs:OperatingIncome contextRef="CurrentYearDuration" '
+        'unitRef="JPY" decimals="0" scale="6">45</jppfs:OperatingIncome>'
+        '</xbrl>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("XBRL/PublicDoc/test.xbrl", xbrl)
+    return buf.getvalue()
+
+
 class BackfillRegressionTest(unittest.TestCase):
     """run_batch + combine の小さな合成回帰 (変換対象のない zip は失敗として
-    隔離され、目録の再読み込みでも状態が保たれることを確認する)。"""
+    隔離され目録の再読み込みでも状態が保たれることと、有効な XBRL を含む
+    zip は ok として処理され再実行で飛ばされることを確認する)。"""
 
     def test_run_batch_records_failure_and_survives_reload(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,6 +172,50 @@ class BackfillRegressionTest(unittest.TestCase):
             out_path, rows, _, missing = combine(jobs, state_dir, out_dir)
             self.assertTrue(os.path.exists(out_path))
             self.assertEqual(missing, [])
+
+    def test_run_batch_success_path_records_ok_and_skips_on_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tars_dir = os.path.join(tmp, "tars")
+            state_dir = os.path.join(tmp, "state")
+            out_dir = os.path.join(tmp, "out")
+            zip_bytes = _make_valid_doc_zip()
+            _make_tar(tars_dir, "2016-03-22", "S100OK01", zip_bytes)
+            jobs = [{"doc_id": "S100OK01", "doc_type": "120",
+                     "parent_doc_id": None, "submit_at": "2016-03-22 10:00",
+                     "raw_zip_path": "raw/edinet/year=2016/month=03/day=22/"
+                                     "zip/S100OK01.zip"}]
+            summary = run_batch(jobs, {}, {}, tars_dir, state_dir, out_dir)
+            self.assertEqual(summary["jobs"], 1)
+            self.assertEqual(summary["processed_ok"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(summary["rows_total"], 2)
+            ledger_path = os.path.join(state_dir, "ledger.jsonl")
+            ledger = Ledger(ledger_path)
+            entry = ledger.latest["S100OK01"]
+            self.assertEqual(entry["status"], "ok")
+            self.assertEqual(entry["rows"], 2)
+            self.assertEqual(entry["zip_sha256"],
+                             hashlib.sha256(zip_bytes).hexdigest())
+            self.assertEqual(ledger.attempts["S100OK01"], 1)
+            shard_path = os.path.join(out_dir, "silver", "S100OK01.parquet")
+            self.assertTrue(os.path.exists(shard_path))
+            self.assertTrue(ledger.is_done(
+                "S100OK01", entry["zip_sha256"], shard_path))
+            out_path, rows, _, missing = combine(jobs, state_dir, out_dir)
+            self.assertEqual(rows, 2)
+            self.assertEqual(missing, [])
+            combined = pq.read_table(out_path).to_pylist()
+            self.assertEqual(
+                {(r["element"], r["value"]) for r in combined},
+                {("jppfs_cor:NetSales", 123000000.0),
+                 ("jppfs_cor:OperatingIncome", 45000000.0)})
+            rerun = run_batch(jobs, {}, {}, tars_dir, state_dir, out_dir)
+            self.assertEqual(rerun["processed_ok"], 0)
+            self.assertEqual(rerun["skipped_done"], 1)
+            self.assertEqual(rerun["failed"], 0)
+            reloaded = Ledger(ledger_path)
+            self.assertEqual(reloaded.attempts["S100OK01"], 1)
+            self.assertEqual(reloaded.latest["S100OK01"]["status"], "ok")
 
 
 if __name__ == "__main__":
