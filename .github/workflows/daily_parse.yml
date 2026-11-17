@@ -159,6 +159,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -euo pipefail
+          mkdir -p work
           python -m pipeline.parse merge \
             --plan work/dl-plan/plan.json \
             --shards-dir work/dl-shards \

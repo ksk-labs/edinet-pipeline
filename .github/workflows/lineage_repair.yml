@@ -30,6 +30,7 @@ jobs:
           DOC_IDS: ${{ inputs.doc_ids }}
         run: |
           set -euo pipefail
+          mkdir -p work
           python -m pipeline.parse repair-lineage \
             --doc-ids "$DOC_IDS" \
             --work-dir work/repair | tee work/repair-summary.json
