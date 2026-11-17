@@ -15,6 +15,14 @@
   取得に失敗した日は v1 索引の行から組み立てた行で代用し、
   catalog_source=v1_index_fallback と明記する (索引自体が EDINET
   一覧の蓄積であるため、提出日・種別・親書類の確定には足りる)。
+  出所フィールドの読み方: source (catalog_row が付ける
+  SOURCE_KIND=edinet_api) は源泉種別であり、行ごとの観測経路は
+  表さない。行が一覧 API の直接観測か索引由来の代用かは
+  catalog_source が正であり (edinet_list_api=直接観測、
+  v1_index_fallback=代用)、出所の判定は catalog_source で行う
+  こと。代用行も catalog_row を通るため source と fetched_at は
+  観測行と同型になるが、それをもって直接観測とみなしては
+  ならない。
 - 原形 (raw/edinet/YYYY/MM/DD/zip/<docID>.zip): 書類取得 API の
   type=1 を取得し、discovery と同じ保存先・同じ形式検証で保存する。
   取得は zip のみ (Silver への追加が目的であり、PDF 等は v1 側に
@@ -209,7 +217,9 @@ def run_acquire(index_path, work_dir, repo=DEFAULT_REPO, client=None,
                          f"acquisition/month={month}/ledger.jsonl",
                          f"backfill-missing {month}: acquisition ledger")
 
-        # 書類目録への追記 (観測の記録。原形の取得成否に依存しない)。
+        # 書類目録への追記 (一覧で観測できた行は観測の記録、
+        # できなかった行は索引由来の代用行。原形の取得成否に
+        # 依存しない)。区別は catalog_source が担う。
         fetched_at = _now()
         for row in rows:
             doc_id = row["doc_id"]

@@ -16,7 +16,8 @@ dispatch) は着地後に別途行う。
   2024-11-13〜15 が 4 件など)。提出月は 2024-11 (4)、2024-12 (1)、
   2026-03 (222)、2026-04 (1)、2026-11 (22)。
 - 対象に doc_type=130 (訂正報告書) は 0 件。対象を親に持つ書類は
-  17 件あるが、doc_type=130 の子は 0 件のため、Silver へ追加しても
+  27 件 (母数内では 24 件)、子を持つ対象は 17 件あるが、
+  doc_type=130 の子は 0 件のため、Silver へ追加しても
   既存書類の superseded_by は変わらない (系譜の再計算は不要)。
 
 ## 変更内容
@@ -50,18 +51,51 @@ Secrets から渡す (取得はこのワークフロー経由でのみ行う)。
 
 照合項目 6 を追加した。未収穫だった書類はすべて、recovered
 (Silver に追加済み。解析目録 ok + 結合 parquet の行数一致)、
-unobtainable (取得目録 failed で理由つき)、quarantined (取得できたが
-解析で隔離)、unexplained のどれかに分類される。quarantined と
-unexplained が残れば終了コード 1 になる。
+unobtainable (取得目録 failed のうち、error_kind=EdinetError で
+理由が記録されているものだけ。下記「レビュー修正」参照)、
+quarantined (取得できたが解析で隔離)、unexplained のどれかに
+分類される。quarantined と unexplained が残れば終了コード 1 に
+なる。
 
 ### tests/test_backfill_missing.py (新規)
 
 対象選定、目録の源泉の明記、取得の成否の記録、再実行での
 スキップ (冪等)、一覧失敗時の代用、照合の分類の 7 件。
+レビュー修正で 5 件を追加し 12 件になった (下記「レビュー修正」
+の SF-2)。
+
+## レビュー修正 (2026-11-17、PR #36 コードレビューへの対応)
+
+- MF-1 (must-fix): 照合の classify_missing が、取得目録の failed を
+  理由不問で unobtainable (終端) にしていた欠陥を修正した。
+  unobtainable は error_kind=EdinetError (EDINET 側の恒常的な
+  取得不能) で error に理由が記録されている場合に限定し、
+  upload_unconfirmed、_RetryableHttpError (429/5xx の再試行枯渇)、
+  OSError、理由が空の failed は unexplained に倒す。これにより
+  一時的な失敗では照合の終了コードが 0 にならない。分類テストに
+  レビュー役の分類実験のケース (一時失敗 8 形式) を追加し、
+  修正前コードで失敗し修正後に合格することを確認した。
+- SF-1: 「実測した前提」の系譜の数値を訂正した (対象を親に持つ
+  書類は 27 件・母数内 24 件、17 は子を持つ対象の distinct 数)。
+- SF-2: 回帰テストを追加した。upload_unconfirmed への振り替え
+  (ok を書かない負系)、failed の書類が再実行で再試行されること、
+  max_docs による stopped_early の 3 件と、MF-1 の分類テスト
+  2 件で計 5 件。
+- SF-3: 書類目録の出所の読み方を明記した。source (catalog_row が
+  付ける edinet_api) は源泉種別であり行ごとの観測経路は表さず、
+  一覧 API の直接観測か v1 索引由来の代用かは catalog_source
+  (edinet_list_api / v1_index_fallback) が正である。この読み方を
+  pipeline/backfill_missing.py のモジュール説明にも記した。
+  値の分離は行わなかった。既存の消費者の確認結果: parse の plan は
+  書類目録から submitDateTime・docTypeCode・parentDocID だけを
+  読み source / catalog_source は使わず、monitor は書類目録を
+  読まないため、現行の値でも取り違えは起きていないことと、
+  source は discovery と共有する catalog_row の契約であること
+  から、説明の明記で足りると判断した。
 
 ## 検証
 
-- 新規テスト 7 件合格。既存を含む全 68 件も合格
+- 新規テスト 12 件合格。既存を含む全 73 件も合格
   (`python -m unittest discover -s tests`)。
 - 拡張した照合を実データ (v2 の実物) で実走した: 既存の照合項目は
   従来どおりすべて一致 (母数 305,662、ok 305,412、行数 50,560,027 で

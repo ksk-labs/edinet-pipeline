@@ -17,8 +17,11 @@
    どれかに分類されなければならない (classify_missing)。
    - recovered: 取得目録が ok で、解析目録が ok で、結合 parquet の
      行数が解析目録の記録と一致する (Silver に追加済み)。
-   - unobtainable: 取得目録の最新行が failed (EDINET API から取得
-     できなかった。理由は error_kind と error に記録されている)。
+   - unobtainable: 取得目録の最新行が failed で、error_kind が
+     EdinetError (EDINET 側の恒常的な取得不能) かつ error に理由が
+     記録されているものだけ。一時的な失敗 (upload_unconfirmed、
+     429/5xx の再試行枯渇、OSError 等) と理由の無い failed は
+     終端にせず unexplained に倒す。
    - quarantined: 取得できたが解析で隔離された (解析目録の最新行が
      quarantined。Silver には入っていないため未説明として扱う)。
    - unexplained: 上のどれでもない (未説明。終了コード 1)。
@@ -50,6 +53,26 @@ def _download(url, dest):
             f.write(chunk)
 
 
+UNOBTAINABLE_ERROR_KIND = "EdinetError"
+
+
+def _is_unobtainable(acquired):
+    """取得目録の failed 行が終端の「取得不能」に当たるかを判定する。
+
+    終端にできるのは、EDINET 側の恒常的な取得不能を示す
+    EdinetError で、理由 (error) が記録されている場合だけである。
+    upload_unconfirmed (EDINET からは取得できており再実行で回復
+    する)、_RetryableHttpError (429/5xx の再試行枯渇)、OSError 等の
+    一時的な失敗と、理由が空の failed は終端にしない。
+    """
+    if acquired is None or acquired.get("status") != "failed":
+        return False
+    if acquired.get("error_kind") != UNOBTAINABLE_ERROR_KIND:
+        return False
+    error = acquired.get("error")
+    return isinstance(error, str) and bool(error.strip())
+
+
 def classify_missing(no_zip, parse_latest, acq_latest, doc_rows):
     """未収穫だった書類を recovered / unobtainable / quarantined /
     unexplained に分類する (照合項目 6)。
@@ -76,7 +99,7 @@ def classify_missing(no_zip, parse_latest, acq_latest, doc_rows):
         elif parsed is not None and parsed.get("status") == "quarantined":
             quarantined.append({"doc_id": doc_id, "month": month,
                                 "reason": parsed.get("reason")})
-        elif acquired is not None and acquired.get("status") == "failed":
+        elif _is_unobtainable(acquired):
             unobtainable.append({"doc_id": doc_id, "month": month,
                                  "error_kind": acquired.get("error_kind"),
                                  "error": acquired.get("error")})

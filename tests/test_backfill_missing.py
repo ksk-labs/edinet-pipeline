@@ -103,6 +103,14 @@ class FakeHfApi:
                     self.remote[f"{path_in_repo}/{rel}"] = f.read()
 
 
+class NoUploadHfApi(FakeHfApi):
+    """upload_folder が何も上げない偽 HF (upload_unconfirmed の負系用)。"""
+
+    def upload_folder(self, folder_path, repo_id, repo_type="dataset",
+                      path_in_repo=None, commit_message=None):
+        return None
+
+
 def make_hf_download(remote, cache_dir):
     def fake_hf_hub_download(repo_id, filename, repo_type="dataset",
                              local_dir=None, token=None):
@@ -216,6 +224,57 @@ class RunAcquireTest(unittest.TestCase):
         self.assertEqual(summary["skipped_done"], 2)
         self.assertEqual(len(client.doc_calls), calls_after_first)
 
+    def test_upload_unconfirmed_is_failed_not_ok(self):
+        index_path = os.path.join(self.tmp.name, "index_up.parquet")
+        write_index(index_path, [index_row("UP1", "2026-03-13 09:00")])
+        api = NoUploadHfApi(self.remote)
+        client = FakeClient(bodies={"UP1": ZIP_BODY})
+        with mock.patch.object(backfill_missing, "HfApi", lambda: api):
+            summary = backfill_missing.run_acquire(
+                index_path, os.path.join(self.tmp.name, "work_up"),
+                repo="fake/repo", client=client)
+        self.assertEqual(summary["acquired_doc_ids"], [])
+        self.assertEqual(summary["failed_doc_ids"], ["UP1"])
+        self.assertEqual(summary["failed"], 1)
+        acq = read_ledger(self.remote,
+                          "acquisition/month=2026-03/ledger.jsonl")
+        self.assertTrue(acq)
+        self.assertTrue(all(e["status"] != "ok" for e in acq))
+        latest = {e["doc_id"]: e for e in acq}
+        self.assertEqual(latest["UP1"]["status"], "failed")
+        self.assertEqual(latest["UP1"]["error_kind"], "upload_unconfirmed")
+
+    def test_failed_doc_is_retried_on_rerun(self):
+        client = FakeClient(
+            bodies={"OK1": ZIP_BODY},
+            errors={"NG1": EdinetError("取得できませんでした")})
+        first = backfill_missing.run_acquire(
+            self.index_path, self.work_dir, repo="fake/repo",
+            client=client)
+        self.assertEqual(first["failed_doc_ids"], ["NG1"])
+        client2 = FakeClient(bodies={"OK1": ZIP_BODY, "NG1": ZIP_BODY})
+        second = backfill_missing.run_acquire(
+            self.index_path, self.work_dir, repo="fake/repo",
+            client=client2)
+        self.assertEqual(second["skipped_done"], 1)
+        self.assertEqual(second["failed"], 0)
+        self.assertEqual(second["acquired_doc_ids"], ["NG1", "OK1"])
+        self.assertIn(("NG1", 1), client2.doc_calls)
+        acq = read_ledger(self.remote,
+                          "acquisition/month=2026-03/ledger.jsonl")
+        latest = {e["doc_id"]: e for e in acq}
+        self.assertEqual(latest["NG1"]["status"], "ok")
+
+    def test_max_docs_stops_early(self):
+        client = FakeClient(bodies={"OK1": ZIP_BODY, "NG1": ZIP_BODY})
+        summary = backfill_missing.run_acquire(
+            self.index_path, self.work_dir, repo="fake/repo",
+            client=client, max_docs=1)
+        self.assertEqual(summary["attempted"], 1)
+        self.assertTrue(summary["stopped_early"])
+        self.assertEqual(summary["downloaded"], 1)
+        self.assertEqual(summary["acquired_doc_ids"], ["OK1"])
+
     def test_list_failure_falls_back_to_index(self):
         client = FakeClient(
             bodies={"OK1": ZIP_BODY, "NG1": ZIP_BODY},
@@ -267,6 +326,49 @@ class ClassifyMissingTest(unittest.TestCase):
         self.assertEqual([e["doc_id"] for e in result["quarantined"]],
                          ["QUA"])
         self.assertEqual(result["unexplained"], ["UNE"])
+
+    def _classify_one(self, acq_entry):
+        no_zip = [{"doc_id": "X", "submit_at": "2026-03-13 09:00"}]
+        acq_latest = {} if acq_entry is None else {"X": acq_entry}
+        return self.reconcile.classify_missing(no_zip, {}, acq_latest, {})
+
+    def test_temporary_failures_are_unexplained_not_unobtainable(self):
+        cases = {
+            "upload_unconfirmed": {
+                "status": "failed", "error_kind": "upload_unconfirmed",
+                "error": "アップロード後に遠隔で実在を確認できませんでした"},
+            "retryable_http": {
+                "status": "failed", "error_kind": "_RetryableHttpError",
+                "error": "HTTP 429"},
+            "os_error": {
+                "status": "failed", "error_kind": "OSError",
+                "error": "Connection reset by peer"},
+            "no_reason": {
+                "status": "failed", "error_kind": None, "error": None},
+            "missing_fields": {"status": "failed"},
+            "edinet_error_empty_reason": {
+                "status": "failed", "error_kind": "EdinetError",
+                "error": ""},
+            "edinet_error_no_reason": {
+                "status": "failed", "error_kind": "EdinetError",
+                "error": None},
+            "edinet_error_blank_reason": {
+                "status": "failed", "error_kind": "EdinetError",
+                "error": "  "},
+        }
+        for name, entry in cases.items():
+            with self.subTest(case=name):
+                result = self._classify_one(entry)
+                self.assertEqual(result["unobtainable"], [])
+                self.assertEqual(result["unexplained"], ["X"])
+
+    def test_edinet_error_with_reason_is_unobtainable(self):
+        result = self._classify_one({
+            "status": "failed", "error_kind": "EdinetError",
+            "error": "取得できませんでした"})
+        self.assertEqual([e["doc_id"] for e in result["unobtainable"]],
+                         ["X"])
+        self.assertEqual(result["unexplained"], [])
 
     def test_row_count_mismatch_is_unexplained(self):
         no_zip = [{"doc_id": "REC", "submit_at": "2026-03-13 09:00"}]
