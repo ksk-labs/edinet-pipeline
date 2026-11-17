@@ -72,7 +72,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import traceback
 import zipfile
 from collections import Counter
@@ -86,6 +85,7 @@ from huggingface_hub.errors import EntryNotFoundError
 
 from .batch import SILVER_SCHEMA
 from .convert_core import normalize_prefix
+from .hf_sync import _with_retry
 
 ARELLE_VERSION = "2.47.5"
 DEFAULT_REPO = "Yoshi-Dai/financial-lakehouse-v2"
@@ -124,27 +124,6 @@ def _now():
 
 def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
-
-
-def _retryable(exc):
-    status = getattr(getattr(exc, "response", None), "status_code", None)
-    if status is not None:
-        return status == 429 or status >= 500
-    return isinstance(exc, OSError)
-
-
-def _with_retry(what, fn):
-    """HF API 呼び出しを指数バックオフで再試行する (pipeline.hf_sync と同じ方針)。"""
-    delays = (5, 15, 30, 60, 120)
-    for attempt in range(len(delays) + 1):
-        try:
-            return fn()
-        except Exception as exc:
-            if attempt == len(delays) or not _retryable(exc):
-                raise
-            print(f"{what}: retry {attempt + 1} after error: {exc!r}",
-                  file=sys.stderr)
-            time.sleep(delays[attempt])
 
 
 def _remote_files(api, repo):
@@ -205,7 +184,6 @@ def _fetch_ledgers(api, repo, remote, prefix, work_dir):
     return out
 
 
-# ---------------------------------------------------------------- 抽出
 
 class Quarantine(Exception):
     """仕様 §2 の判定規則で取り込みを止める (隔離する) 場合の内部例外。"""
@@ -450,7 +428,6 @@ def _concept_labels(concept):
     return out
 
 
-# ---------------------------------------------------------------- 検証
 
 def detect_taxonomy_date(zip_path):
     """zip 内の .xbrl から、参照しているタクソノミの版の日付を推定する。
@@ -544,7 +521,6 @@ def run_validation(zip_path, webcache_dir, work_dir, doc_id):
     return result
 
 
-# ---------------------------------------------------------------- plan
 
 def run_plan(date, doc_ids, max_docs, work_dir, repo=DEFAULT_REPO):
     """未解析の zip を対象として計画を作り、plan.json を書く。
@@ -625,7 +601,6 @@ def run_plan(date, doc_ids, max_docs, work_dir, repo=DEFAULT_REPO):
     return plan
 
 
-# ---------------------------------------------------------------- shard
 
 def _silver_rows(doc, facts):
     """抽出事実を Silver の行 (batch.SILVER_SCHEMA の dict) にする。
@@ -797,7 +772,6 @@ def _append_jsonl(path, entry):
         os.fsync(f.fileno())
 
 
-# ---------------------------------------------------------------- merge
 
 def _winner(candidates):
     """訂正の勝者を決める。candidates は {doc_id: submit_at}。
@@ -949,9 +923,19 @@ def run_merge(plan_path, shards_dir, work_dir, repo=DEFAULT_REPO):
             if by_doc.get(doc_id):
                 current = by_doc[doc_id][0].get("superseded_by")
             if current and current not in cands:
-                sat = submit_at_of(current)
-                if sat:
-                    cands[current] = sat
+                cur_entry = parse_latest.get(current)
+                if cur_entry is not None:
+                    # 解析目録で種別が分かる値は repair-lineage と同じ判定
+                    # (doc_type=130 のときだけ候補に含める)。
+                    if cur_entry.get("doc_type") == "130":
+                        cands.setdefault(current,
+                                          cur_entry.get("submit_at"))
+                else:
+                    # 解析目録に無い (バックフィル期の) 値は、現在の値と
+                    # Silver の行から引く提出日時に頼る。
+                    sat = submit_at_of(current)
+                    if sat:
+                        cands[current] = sat
             return _winner(cands)
 
         # 取り込む書類: 既存の行を置き換える
@@ -1049,13 +1033,17 @@ def run_merge(plan_path, shards_dir, work_dir, repo=DEFAULT_REPO):
         _upload_file(api, repo, local, remote_path,
                      f"parse {plan.get('date') or ''}: extension labels {month}")
     summary["finished_at"] = _now()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_part = plan.get("date") or summary["started_at"][:10]
     for month in sorted(set(entries_by_month) | set(new_silver)):
         local = os.path.join(work_dir, "summaries", month, "run_summary.json")
         os.makedirs(os.path.dirname(local), exist_ok=True)
         with open(local, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
-        _upload_file(api, repo, local, f"parse/month={month}/run_summary.json",
-                     f"parse {plan.get('date') or ''}: run summary {month}")
+        _upload_file(
+            api, repo, local,
+            f"parse/month={month}/run_summary-{date_part}-{stamp}.json",
+            f"parse {plan.get('date') or ''}: run summary {month}")
     return summary
 
 
@@ -1168,7 +1156,6 @@ def run_repair_lineage(doc_ids, work_dir, repo=DEFAULT_REPO):
     return summary
 
 
-# ---------------------------------------------------------------- CLI
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="EDINET 日次解析 (S2-T5 §2・§3)")
