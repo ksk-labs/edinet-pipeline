@@ -14,8 +14,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from pipeline.company_master import (
-    apply_new_snapshots, empty_state, evaluate_jcn_link, majority_value,
-    security_kind, state_from_history,
+    apply_new_snapshots, corroboration_checks, empty_state,
+    evaluate_jcn_link, majority_value, rotated_form, security_kind,
+    state_from_history,
 )
 from pipeline.codelist import EXPECTED_COLUMNS
 
@@ -86,6 +87,23 @@ def build_history_dir(path):
                        os.path.join(path, f"{name}.parquet"))
 
 
+def write_history_dir(path, history, connections=(), review=()):
+    os.makedirs(path, exist_ok=True)
+    codes = sorted({h["edinet_code"] for h in history})
+    roster = [{
+        "edinet_code": c, "first_observed_date": "2020-01-05",
+        "last_observed_date": "2020-02-01", "document_count": 1,
+        "distinct_name_count": 1, "distinct_jcn_count": 1,
+        "distinct_securities_code_count": 1, **PROV,
+    } for c in codes]
+    for name, rows in (("identifier_history", history),
+                       ("code_roster", roster),
+                       ("code_connections", list(connections)),
+                       ("review_items", list(review))):
+        pq.write_table(pa.Table.from_pylist(rows),
+                       os.path.join(path, f"{name}.parquet"))
+
+
 def cl_row(code, name, jcn="", sec="", address="", industry="機械",
            filer_type="内国法人・組合", listing="上場", consolidated="有",
            capital="100", fy_end="3月31日", name_en="", name_kana=""):
@@ -135,6 +153,21 @@ class SecurityKindTest(unittest.TestCase):
         self.assertEqual(security_kind(""), ("不明", None))
 
 
+class RotatedFormTest(unittest.TestCase):
+    def test_leading_zero_rotates(self):
+        self.assertEqual(rotated_form("04018"), "40180")
+        self.assertEqual(rotated_form("04364"), "43640")
+
+    def test_non_leading_zero_has_no_rotation(self):
+        self.assertIsNone(rotated_form("40180"))
+        self.assertIsNone(rotated_form("72030"))
+
+    def test_placeholder_and_short_codes_excluded(self):
+        self.assertIsNone(rotated_form("00000"))
+        self.assertIsNone(rotated_form("0401"))
+        self.assertIsNone(rotated_form(""))
+
+
 class MajorityValueTest(unittest.TestCase):
     def test_unique_majority(self):
         self.assertEqual(majority_value({"a": 3, "b": 2}), "a")
@@ -161,6 +194,10 @@ class EvaluateJcnLinkTest(unittest.TestCase):
         self.assertEqual(
             evaluate_jcn_link({"J": 1}, {"J": 5}, "J", False, True, False),
             "corroborated")
+
+    def test_corroborated_requires_name_or_address(self):
+        self.assertIsNone(
+            evaluate_jcn_link({"J": 1}, {"J": 5}, "J", False, False, False))
 
     def test_sec_conflict_blocks_corroborated(self):
         self.assertIsNone(
@@ -307,6 +344,153 @@ class PlaceholderAndReviewTest(unittest.TestCase):
                  if r["item_type"] == "jcn_link_needs_review"]
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["edinet_code_a"], "E00011")
+
+
+class CorroborationChecksTest(unittest.TestCase):
+    CONN = [{"edinet_code_a": "E00001", "edinet_code_b": "E00002",
+             "strength": "corroborated"}]
+
+    def check(self, rows):
+        return corroboration_checks(self.CONN, rows)[0]
+
+    def test_both_present_all_match(self):
+        entry = self.check([
+            cl_row("E00001", "株式会社アルファ", JCN_ALPHA, "11110",
+                   "東京都千代田区1"),
+            cl_row("E00002", "アルファ株式会社", JCN_ALPHA, "11110",
+                   "東京都千代田区1"),
+        ])
+        self.assertTrue(entry["both_present"])
+        self.assertTrue(entry["jcn_match"])
+        self.assertTrue(entry["address_match"])
+        self.assertTrue(entry["securities_code_match"])
+        self.assertFalse(entry["contradiction"])
+
+    def test_both_present_jcn_contradiction(self):
+        entry = self.check([
+            cl_row("E00001", "株式会社アルファ", JCN_ALPHA, "11110",
+                   "東京都千代田区1"),
+            cl_row("E00002", "アルファ株式会社", JCN_BETA, "11110",
+                   "東京都千代田区1"),
+        ])
+        self.assertTrue(entry["both_present"])
+        self.assertFalse(entry["jcn_match"])
+        self.assertTrue(entry["contradiction"])
+
+    def test_only_one_present(self):
+        entry = self.check([
+            cl_row("E00002", "アルファ株式会社", JCN_ALPHA, "11110",
+                   "東京都千代田区1"),
+        ])
+        self.assertFalse(entry["both_present"])
+        self.assertEqual(entry["present_code"], "E00002")
+        self.assertFalse(entry["contradiction"])
+
+    def test_neither_present(self):
+        entry = self.check([])
+        self.assertFalse(entry["both_present"])
+        self.assertIsNone(entry["present_code"])
+        self.assertFalse(entry["contradiction"])
+
+
+class InitialIdOrderTest(unittest.TestCase):
+    def test_ids_follow_representative_code_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_dir = os.path.join(tmp, "history")
+            build_history_dir(history_dir)
+            state = state_from_history(history_dir, GEN)
+        by_code = {r["edinet_code"]: r["internal_id"]
+                   for r in state["edinet_codes"]}
+        self.assertEqual(by_code, {"E00001": 1, "E00002": 1,
+                                   "E00003": 2, "E00004": 3})
+        self.assertEqual(state["meta"]["next_internal_id"], 4)
+
+
+class HistorySecuritiesTest(unittest.TestCase):
+    def build(self, history):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        history_dir = os.path.join(tmp.name, "history")
+        write_history_dir(history_dir, history)
+        return state_from_history(history_dir, GEN)
+
+    def test_placeholder_in_history_is_not_a_security(self):
+        state = self.build([
+            hist_row("E00001", "securities_code", "00000", 3,
+                     placeholder=True),
+            hist_row("E00001", "securities_code", "11110", 5),
+        ])
+        self.assertEqual([s["securities_code"] for s in state["securities"]],
+                         ["11110"])
+        ident = [h for h in state["identifier_history"]
+                 if h["kind"] == "securities_code"]
+        self.assertEqual(len(ident), 2)
+        self.assertTrue(any(h["is_placeholder"] for h in ident))
+
+    def test_leading_zero_merges_into_rotated_form(self):
+        state = self.build([
+            hist_row("E00001", "securities_code", "04018", 1,
+                     first="2021-08-11", last="2021-08-11"),
+            hist_row("E00001", "securities_code", "40180", 39,
+                     first="2021-08-26", last="2026-09-25"),
+        ])
+        secs = state["securities"]
+        self.assertEqual(len(secs), 1)
+        self.assertEqual(secs[0]["securities_code"], "40180")
+        self.assertEqual(secs[0]["security_kind"], "普通株式")
+        self.assertEqual(secs[0]["observation_count"], 40)
+        self.assertEqual(secs[0]["first_observed_date"], "2021-08-11")
+        self.assertEqual(secs[0]["last_observed_date"], "2026-09-25")
+        items = [r for r in state["review_items"]
+                 if r["item_type"] == "security_kind_unverified"]
+        self.assertEqual(items, [])
+
+    def test_leading_zero_without_rotation_is_unverified(self):
+        state = self.build([
+            hist_row("E00001", "securities_code", "04364", 3),
+            hist_row("E00001", "securities_code", "43600", 34),
+        ])
+        by_value = {s["securities_code"]: s for s in state["securities"]}
+        self.assertEqual(by_value["04364"]["security_kind"], "未確認")
+        self.assertIsNone(by_value["04364"]["reserve_digit"])
+        self.assertEqual(by_value["43600"]["security_kind"], "普通株式")
+        items = [r for r in state["review_items"]
+                 if r["item_type"] == "security_kind_unverified"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["shared_value"], "04364")
+        self.assertEqual(items[0]["edinet_code_a"], "E00001")
+        self.assertIsNotNone(items[0]["internal_id_a"])
+
+
+class SnapshotSecurityRuleTest(unittest.TestCase):
+    def test_snapshot_leading_zero_without_rotation_is_unverified(self):
+        state = empty_state(GEN)
+        rows = [cl_row("E00030", "株式会社ミカクニン", "1000000000030",
+                       "04364", "東京都")]
+        apply_new_snapshots(state, [("2026-11-17", rows)], GEN)
+        self.assertEqual(len(state["securities"]), 1)
+        self.assertEqual(state["securities"][0]["security_kind"], "未確認")
+        items = [r for r in state["review_items"]
+                 if r["item_type"] == "security_kind_unverified"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["edinet_code_a"], "E00030")
+
+    def test_snapshot_variant_merges_into_existing_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_dir = os.path.join(tmp, "history")
+            write_history_dir(history_dir, [
+                hist_row("E00001", "securities_code", "40180", 39,
+                         first="2021-08-26", last="2026-09-25"),
+            ])
+            state = state_from_history(history_dir, GEN)
+        rows = [cl_row("E00001", "株式会社カイシャ", "1000000000001",
+                       "04018", "東京都")]
+        apply_new_snapshots(state, [("2026-11-17", rows)], GEN)
+        secs = state["securities"]
+        self.assertEqual(len(secs), 1)
+        self.assertEqual(secs[0]["securities_code"], "40180")
+        self.assertEqual(secs[0]["observation_count"], 40)
+        self.assertTrue(secs[0]["in_latest_snapshot"])
 
 
 class StateRoundtripTest(unittest.TestCase):
