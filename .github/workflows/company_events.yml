@@ -1,0 +1,51 @@
+name: company_events
+
+# 会社イベントと親子関係 (P2-T4、pipeline.company_events) の運用
+# ワークフロー。v1 索引 (書類メタデータ) を入力に、臨時報告書の
+# イベントと親会社等状況報告書からの親子関係を構築し、v2
+# データセットの master/ 配下へ配置する。
+# - build: 対象期間 (提出日 2021-11-01 以降) の全件を再構築する
+#   (入力全部からの冪等な置き換え)。日次の差分更新は書類目録
+#   (S2-T5) 側の経路が整ってから後続作業で配線する。
+# 必要な秘密は HF_TOKEN のみ (v1 索引と v2 データセットの読み取りは
+# 公開のため不要)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "対象の開始日 (提出日、YYYY-MM-DD)"
+        required: false
+        type: string
+        default: "2021-11-01"
+
+jobs:
+  company-events:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Build company events and relationships
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SINCE: ${{ inputs.since }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/events
+          python -m pipeline.company_events build \
+            --work-dir work/events --since "$SINCE" --upload \
+            | tee work/events/result.json
+      - name: Upload build summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: company-events-summary
+          path: |
+            work/events/result.json
+            work/events/master_out/company_events_summary.json
+          if-no-files-found: warn
