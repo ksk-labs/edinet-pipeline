@@ -1,0 +1,172 @@
+name: daily_parse
+
+# S2-T5 §2・§3 日次解析 (pipeline.parse)。塊1 (daily_acquire) が取得した
+# 書類の原形 (zip) を arelle で解析し、EDINET 専用プラグインの検証を
+# 行って、v2 データセットの Silver へ追記する。
+# - plan: 取得目録と書類目録から未解析の zip を選び、計画を作る。
+# - parse: 計画をマトリクスで分担し、書類ごとに解析する (HF へは書かない)。
+#   タクソノミのキャッシュ (arelle の webcache) は actions/cache で
+#   ジョブ間に使い回す。検証の別プロセスも同じキャッシュを使う。
+# - merge: 全 shard の結果を月別の Silver へ反映し、解析目録を push する。
+# - workflow_dispatch: 日付を指定して手動実行する。date は提出日で、
+#   空なら未解析の全件が対象になる (doc_ids 指定時はそちらが優先)。
+# - cron 化は schedule を足すだけでよいが、定期実行の有効化は本塊の範囲外。
+# - arelle の版は 2.47.5 に固定する (版更新時は標本照合が必須。仕様 §2)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "対象の提出日 (YYYY-MM-DD、空なら未解析の全件)"
+        required: false
+        type: string
+        default: ""
+      doc_ids:
+        description: "対象の書類 ID (カンマ区切り、指定時は date より優先)"
+        required: false
+        type: string
+        default: ""
+      max_docs:
+        description: "今回の実行で解析する書類数の上限 (空なら無制限。動作確認用)"
+        required: false
+        type: string
+        default: ""
+      shards:
+        description: "parse ジョブの分割数"
+        required: false
+        type: string
+        default: "4"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+      shard_list: ${{ steps.plan.outputs.shard_list }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Build plan
+        id: plan
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATE: ${{ inputs.date }}
+          DOC_IDS: ${{ inputs.doc_ids }}
+          MAX_DOCS: ${{ inputs.max_docs }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          set -euo pipefail
+          args=(--work-dir work/plan)
+          if [ -n "$DATE" ]; then args+=(--date "$DATE"); fi
+          if [ -n "$DOC_IDS" ]; then args+=(--doc-ids "$DOC_IDS"); fi
+          if [ -n "$MAX_DOCS" ]; then args+=(--max-docs "$MAX_DOCS"); fi
+          python -m pipeline.parse plan "${args[@]}"
+          python - <<'PY'
+          import json, os
+          plan = json.load(open("work/plan/plan.json", encoding="utf-8"))
+          targets = len(plan["docs"])
+          want = int(os.environ.get("SHARDS") or "4")
+          n = max(1, min(want, targets)) if targets else 0
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"targets={targets}\n")
+              f.write(f"shard_list={json.dumps(list(range(n)))}\n")
+          print(f"targets={targets} shards={n}")
+          PY
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: work/plan/plan.json
+
+  parse:
+    needs: plan
+    if: needs.plan.outputs.targets != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shard_list) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install arelle-release==2.47.5
+      - name: Restore taxonomy cache
+        uses: actions/cache@v4
+        with:
+          path: work/webcache
+          key: arelle-webcache-2.47.5-v1
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: work/dl-plan
+      - name: Parse shard
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SHARD: ${{ matrix.shard }}
+          SHARD_LIST: ${{ needs.plan.outputs.shard_list }}
+        run: |
+          set -euo pipefail
+          shards=$(python -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$SHARD_LIST")
+          python -m pipeline.parse shard \
+            --plan work/dl-plan/plan.json \
+            --shard "$SHARD" --shards "$shards" \
+            --work-dir work/parse \
+            --webcache-dir work/webcache
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: work/parse/shard-${{ matrix.shard }}
+          if-no-files-found: warn
+
+  merge:
+    needs: [plan, parse]
+    if: needs.plan.outputs.targets != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: work/dl-plan
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: work/dl-shards
+      - name: Merge into Silver
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -m pipeline.parse merge \
+            --plan work/dl-plan/plan.json \
+            --shards-dir work/dl-shards \
+            --work-dir work/merge | tee work/merge-summary.json
+      - name: Upload merge evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parse-merge-evidence
+          path: work/merge-summary.json
+          if-no-files-found: warn
