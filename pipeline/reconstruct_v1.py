@@ -234,7 +234,8 @@ def main(argv):
     for ec, keys in names_by_code.items():
         for k in keys:
             codes_by_name_key[k].add(ec)
-    name_candidate_count = 0
+    name_candidate_rows = 0
+    name_candidate_pairs = set()
     for key, codes in sorted(codes_by_name_key.items()):
         if len(codes) < 2:
             continue
@@ -243,7 +244,8 @@ def main(argv):
             for cb in codes[i + 1:]:
                 if (ca, cb) in linked_pairs:
                     continue
-                name_candidate_count += 1
+                name_candidate_rows += 1
+                name_candidate_pairs.add((ca, cb))
                 add_review(
                     "name_only_candidate", ca, cb, key,
                     "正規化した名称が一致するが、法人番号では結べない。"
@@ -289,7 +291,8 @@ def main(argv):
         "review_items": len(review_items),
         "review_items_by_type": dict(collections.Counter(
             r["item_type"] for r in review_items)),
-        "name_only_candidate_pairs": name_candidate_count,
+        "name_only_candidate_pairs": len(name_candidate_pairs),
+        "name_only_candidate_rows": name_candidate_rows,
     }
     with open(f"{out_dir}/summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
