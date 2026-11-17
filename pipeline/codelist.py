@@ -17,6 +17,10 @@
   成功したスナップショット (保存済みのうち日付が直近のもの) と
   EDINET コード単位で比較し、追加・削除・変更 (項目ごとの旧値と
   新値) を記録する。値の正規化はしない (会社マスタ側の仕事。P2-T3)。
+  差分はスナップショット本体の保存に従属する工程であり、基準の
+  取得に失敗しても本体の保存は成功として記録する。その場合は
+  差分を未生成 (pending) として目録に残し、次回の実行が不足
+  成果物の補完として生成し直す。
 - 目録 (codelist/ledger.jsonl): 実行ごとの結果 (ok・already_present・
   conflict・failed) を追記する。スナップショットの成果物を上げて
   から目録を上げるので、目録が ok を主張して実体が無い状態には
@@ -425,9 +429,77 @@ def run_snapshot(work_dir, repo=DEFAULT_REPO, fetcher=None):
         })
 
 
+def _complete_diff(api, repo, work_dir, snap, summary, paths, remote,
+                   fetched_at):
+    """差分 (diff.json と changes.jsonl) を生成して保存する。
+
+    スナップショット本体とは独立した従属工程として扱い、基準の取得や
+    生成に失敗しても例外にはしない。戻り値は差分の状態 (dict) で、
+    status は generated (今回生成した)・present (既に両方そろって
+    おり再計算しない)・pending (生成できず未生成。次回の実行で補完
+    する) のいずれか。generated のときは base_date と added /
+    removed / changed を、pending のときは error を持つ。保存した
+    パスは completed に入れ、summary["uploaded"] へも追記する。
+    """
+    date = snap["declared_date"]
+    stage_dir = os.path.join(work_dir, "stage")
+    result = {"status": "present", "base_date": None, "added": None,
+              "removed": None, "changed": None, "completed": []}
+    if paths["diff"] in remote and paths["changes"] in remote:
+        return result
+    try:
+        base_date, base_by_code = _previous_snapshot(
+            api, repo, remote, date, work_dir)
+        added, removed, changed = compute_diff(base_by_code,
+                                               snap["by_code"])
+        diff = {
+            "date": date, "base_date": base_date, "generated_at": _now(),
+            "previous_count": len(base_by_code) if base_date else None,
+            "current_count": len(snap["rows"]),
+            "added": len(added), "removed": len(removed),
+            "changed": len(changed),
+            "unchanged": len(snap["rows"]) - len(added) - len(changed),
+            "source": SOURCE_KIND, "source_id": SOURCE_ID,
+            "fetched_at": fetched_at, "redistribution": REDISTRIBUTION,
+        }
+        changes_text = "".join(
+            json.dumps(row, ensure_ascii=False) + "\n"
+            for row in changes_rows(added, removed, changed))
+        products = [
+            (paths["diff"], json.dumps(diff, ensure_ascii=False, indent=2),
+             f"codelist {date}: diff summary"),
+            (paths["changes"], changes_text,
+             f"codelist {date}: diff changes"),
+        ]
+        for repo_path, data, message in products:
+            if repo_path in remote:
+                continue
+            local = os.path.join(stage_dir, repo_path)
+            _write_local(local, data)
+            _upload_file(api, repo, local, repo_path, message)
+            summary["uploaded"].append(repo_path)
+            result["completed"].append(repo_path)
+    except Exception as e:
+        result["status"] = "pending"
+        result["error"] = f"{type(e).__name__}: {e}"[:500]
+        return result
+    result["status"] = "generated"
+    result["base_date"] = base_date
+    result["added"] = len(added)
+    result["removed"] = len(removed)
+    result["changed"] = len(changed)
+    return result
+
+
 def _save_snapshot(api, repo, work_dir, snap, zip_bytes, summary, paths,
                    fetched_at, run_date):
-    """検証済みスナップショットの保存と差分の生成 (run_snapshot の後段)。"""
+    """検証済みスナップショットの保存と差分の生成 (run_snapshot の後段)。
+
+    保存の優先順位はスナップショット本体 (原形 zip・CSV・メタ) を
+    最上位とし、差分は本体に依存しない従属工程とする。基準スナップ
+    ショットの取得に失敗しても本体の保存は成功として記録し、差分は
+    未生成 (pending) として目録に残す。
+    """
     date = snap["declared_date"]
     stage_dir = os.path.join(work_dir, "stage")
     state_dir = os.path.join(work_dir, "state")
@@ -454,14 +526,6 @@ def _save_snapshot(api, repo, work_dir, snap, zip_bytes, summary, paths,
     else:
         status = "ok"
 
-    base_date, base_by_code = _previous_snapshot(
-        api, repo, remote, date, work_dir)
-    added, removed, changed = compute_diff(base_by_code, snap["by_code"])
-    summary["diff_base_date"] = base_date
-    summary["added"] = len(added)
-    summary["removed"] = len(removed)
-    summary["changed"] = len(changed)
-
     meta = {
         "date": date,
         "declared_download_date": snap["declared_date_raw"],
@@ -474,33 +538,16 @@ def _save_snapshot(api, repo, work_dir, snap, zip_bytes, summary, paths,
         "source": SOURCE_KIND, "source_id": SOURCE_ID,
         "fetched_at": fetched_at, "redistribution": REDISTRIBUTION,
     }
-    diff = {
-        "date": date, "base_date": base_date, "generated_at": _now(),
-        "previous_count": len(base_by_code) if base_date else None,
-        "current_count": len(snap["rows"]),
-        "added": len(added), "removed": len(removed),
-        "changed": len(changed),
-        "unchanged": len(snap["rows"]) - len(added) - len(changed),
-        "source": SOURCE_KIND, "source_id": SOURCE_ID,
-        "fetched_at": fetched_at, "redistribution": REDISTRIBUTION,
-    }
-    changes_text = "".join(
-        json.dumps(row, ensure_ascii=False) + "\n"
-        for row in changes_rows(added, removed, changed))
-    products = [
+    body_products = [
         (paths["archive"], zip_bytes,
          f"codelist {date}: original zip (archive)"),
         (paths["csv"], snap["csv_bytes"],
          f"codelist {date}: snapshot"),
         (paths["meta"], json.dumps(meta, ensure_ascii=False, indent=2),
          f"codelist {date}: snapshot meta"),
-        (paths["diff"], json.dumps(diff, ensure_ascii=False, indent=2),
-         f"codelist {date}: diff summary"),
-        (paths["changes"], changes_text,
-         f"codelist {date}: diff changes"),
     ]
     completed = []
-    for repo_path, data, message in products:
+    for repo_path, data, message in body_products:
         if repo_path in remote:
             continue
         local = os.path.join(stage_dir, repo_path)
@@ -508,20 +555,35 @@ def _save_snapshot(api, repo, work_dir, snap, zip_bytes, summary, paths,
         _upload_file(api, repo, local, repo_path, message)
         summary["uploaded"].append(repo_path)
         completed.append(repo_path)
+
+    diff = _complete_diff(api, repo, work_dir, snap, summary, paths,
+                          remote, fetched_at)
+    completed.extend(diff["completed"])
+    summary["diff_status"] = diff["status"]
+    summary["diff_base_date"] = diff["base_date"]
+    summary["added"] = diff["added"]
+    summary["removed"] = diff["removed"]
+    summary["changed"] = diff["changed"]
+    if diff["status"] == "pending":
+        summary["diff_error"] = diff["error"]
     if status == "already_present" and completed:
         summary["completed_missing"] = completed
     summary["status"] = status
-    return _finish_run(api, repo, work_dir, summary, {
+    row = {
         "date": date, "run_date": run_date, "status": status,
         "fetched_at": fetched_at,
         "sha256_csv": summary["sha256_csv"],
         "row_count": summary["row_count"],
-        "diff_base_date": base_date,
-        "added": len(added), "removed": len(removed),
-        "changed": len(changed),
+        "diff_status": diff["status"],
+        "diff_base_date": diff["base_date"],
+        "added": diff["added"], "removed": diff["removed"],
+        "changed": diff["changed"],
         "source": SOURCE_KIND, "source_id": SOURCE_ID,
         "redistribution": REDISTRIBUTION,
-    })
+    }
+    if diff["status"] == "pending":
+        row["diff_error"] = diff["error"]
+    return _finish_run(api, repo, work_dir, summary, row)
 
 
 def main(argv=None):
