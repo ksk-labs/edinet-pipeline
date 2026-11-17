@@ -18,11 +18,12 @@ parse/month=YYYY-MM/extension_labels.jsonl (書類ごとの拡張要素と
   併記する。目録に無い書類は出所の欄を空にし、サマリに数える
   (行自体は落とさない。表示名の観測は目録の有無に依存しない)。
 - 同一キー (doc_id, element, element_ns) の重複は除く。同じキーで
-  表示名が食い違う場合は決定的に (表示名の辞書順で最小の組を) 採り、
-  食い違いをサマリの key_conflicts に記録する。要素名が同じで
-  書類をまたいで表示名が食い違う場合も、行は書類ごとに残したうえで
-  サマリの label_conflicts に記録する (どちらが正かは辞書側では
-  決めない)。
+  表示名が食い違う場合は、表示名のある組を優先し、その中で決定的に
+  (表示名の辞書順で最小の組を) 採り、食い違いをサマリの
+  key_conflicts に記録する。表示名が無い組 (日英とも空) は、実在する
+  表示名を持つ組がある限り採用しない。要素名が同じで書類をまたいで
+  表示名が食い違う場合も、行は書類ごとに残したうえでサマリの
+  label_conflicts に記録する (どちらが正かは辞書側では決めない)。
 
 過去分 (バックフィル済み Silver の期間) には extension_labels が
 無い。その期間の表示名は tar / zip から別途抽出した
@@ -33,6 +34,13 @@ extension_labels 形式の JSONL を同じ build に渡すことで取り込め�
 冪等性: 辞書は入力 JSONL 全部からの再構築であり、同じ入力からは
 同じ行集合 (ソート済み) が得られる。sync は対象月の入力をすべて
 落としてから再構築して置き換えるため、再実行で重複しない。
+
+部分月と upload: sync の成果物は辞書全体であり、--months で一部の
+月だけを指定して --upload すると辞書がその月分だけに縮んでしまう。
+そのため、対象月が実在する全月の一部である場合の --upload は、
+--allow-partial-upload で全体の置き換えを明示しない限りエラーで
+止める。全月を指定した場合 (または --months を省略した場合) は
+通常どおり上げられる。--upload なしの部分月の構築は制限しない。
 
 認証は環境変数 HF_TOKEN (HF への書き込み、huggingface_hub が自動で
 読む) を使う。読み取りは公開データセットなのでトークンなしでも動く。
@@ -101,13 +109,21 @@ def load_jsonl(path):
     return rows, corrupt
 
 
+def _catalog_row_key(row):
+    return (row.get("fetched_at") or "",
+            json.dumps(row, sort_keys=True, ensure_ascii=False,
+                       default=str))
+
+
 def catalog_index(catalog_rows):
     """書類目録の行から docID -> 行 の索引を作る。
 
     目録は同じ書類が取得のたびに重複して載る (2026-11 の実物では
-    1書類あたり3行、fetched_at 以外は同一)。batch.Ledger と同じく
-    最新の行をその書類の状態とし、重複行数を返す (呼び出し側が
-    サマリに残す)。
+    1書類あたり3行、fetched_at 以外は同一)。最新の行をその書類の
+    状態とし、重複行数を返す (呼び出し側がサマリに残す)。「最新」は
+    ファイル内の出現順ではなく fetched_at の最大で決める。
+    fetched_at が同値の場合は行全体の辞書順で決めるため、入力の
+    並びを入れ替えても選ばれる行は変わらない。
     """
     index = {}
     duplicates = 0
@@ -115,9 +131,12 @@ def catalog_index(catalog_rows):
         doc_id = row.get("docID")
         if not doc_id:
             continue
-        if doc_id in index:
-            duplicates += 1
-        index[doc_id] = row
+        if doc_id not in index:
+            index[doc_id] = row
+            continue
+        duplicates += 1
+        if _catalog_row_key(row) > _catalog_row_key(index[doc_id]):
+            index[doc_id] = row
     return index, duplicates
 
 
@@ -139,6 +158,12 @@ def _provenance(catalog_row):
         "fetched_at": catalog_row.get("fetched_at"),
         "redistribution": catalog_row.get("redistribution"),
     }
+
+
+def _variant_sort_key(variant):
+    label_ja, label_en = variant
+    has_label = bool(label_ja) or bool(label_en)
+    return (0 if has_label else 1, label_ja or "", label_en or "")
 
 
 def build_dictionary(label_rows, catalog_by_id):
@@ -163,8 +188,7 @@ def build_dictionary(label_rows, catalog_by_id):
     key_conflicts = []
     duplicates = 0
     for (doc_id, element, element_ns), variants in sorted(groups.items()):
-        distinct = sorted(set(variants),
-                          key=lambda v: (v[0] or "", v[1] or ""))
+        distinct = sorted(set(variants), key=_variant_sort_key)
         duplicates += len(variants) - 1
         if len(distinct) > 1:
             key_conflicts.append({
@@ -194,8 +218,7 @@ def build_dictionary(label_rows, catalog_by_id):
     label_conflicts = [
         {"element": element,
          "variants": [{"label_ja": ja, "label_en": en}
-                      for ja, en in sorted(
-                          variants, key=lambda v: (v[0] or "", v[1] or ""))],
+                      for ja, en in sorted(variants, key=_variant_sort_key)],
          "doc_ids": sorted(docs_by_element[element])}
         for element, variants in sorted(by_element.items())
         if len(variants) > 1
@@ -281,28 +304,45 @@ def _upload(api, repo, local_path, path_in_repo, message):
         repo_id=repo, repo_type="dataset", commit_message=message))
 
 
-def sync(repo, months, work_dir, upload=False):
+def sync(repo, months, work_dir, upload=False, allow_partial_upload=False):
     """v2 データセットの extension_labels から辞書を再構築する。
 
     months が None の場合は、parse/month=*/extension_labels.jsonl が
     実在する月をすべて対象にする。upload=True のときだけ dictionary/
     へ上げる (parquet が先、サマリが後。途中で落ちても次回の再構築が
     同じ内容を置き直す)。
+
+    成果物は辞書全体の置き換えであるため、months が実在する全月の
+    一部のときの upload は、allow_partial_upload が明示されない限り
+    エラーで止める (部分月の内容で辞書全体が縮むのを防ぐ)。
     """
     api = HfApi()
     remote = _with_retry(
         "list_repo_files",
         lambda: api.list_repo_files(repo, repo_type="dataset"))
-    label_paths = sorted(
+    all_label_paths = sorted(
         p for p in remote
         if p.startswith("parse/month=")
         and p.endswith("/extension_labels.jsonl"))
+    available_months = sorted(
+        {p.split("/")[1].split("=", 1)[1] for p in all_label_paths})
+    label_paths = all_label_paths
     if months is not None:
         wanted = set(months)
         label_paths = [p for p in label_paths
                        if p.split("/")[1].split("=", 1)[1] in wanted]
     if not label_paths:
         raise SystemExit("対象の extension_labels.jsonl がありません")
+    if (upload and months is not None
+            and set(months) != set(available_months)
+            and not allow_partial_upload):
+        raise SystemExit(
+            "部分月での --upload は辞書全体をその月分だけに置き換えて"
+            "しまうため拒否します。全月を対象にする ( --months を省略"
+            "するか実在する全月を指定する) か、全体の置き換えを意図する"
+            "場合は --allow-partial-upload を明示してください。"
+            f" 対象月: {sorted(set(months))} / 実在する全月:"
+            f" {available_months}")
 
     local_labels = []
     local_catalogs = []
@@ -352,10 +392,17 @@ def main(argv=None):
 
     s = sub.add_parser("sync", help="v2 データセットから再構築する")
     s.add_argument("--repo", default=DEFAULT_REPO)
-    s.add_argument("--months", help="対象月 YYYY-MM のカンマ区切り (既定は全月)")
+    s.add_argument("--months",
+                   help="対象月 YYYY-MM のカンマ区切り (既定は全月)。"
+                        "--upload と併用する場合、実在する全月の一部を"
+                        "指定すると辞書全体がその月分だけになるため、"
+                        "--allow-partial-upload が無い限りエラーで止まる")
     s.add_argument("--work-dir", required=True)
     s.add_argument("--upload", action="store_true",
-                   help="構築結果を dictionary/ へ上げる")
+                   help="構築結果で dictionary/ の辞書全体を置き換える")
+    s.add_argument("--allow-partial-upload", action="store_true",
+                   help="部分月での --upload を許可し、辞書全体をその"
+                        "月分だけで置き換える (意図する場合のみ指定)")
 
     args = ap.parse_args(argv)
     if args.command == "build":
@@ -364,7 +411,8 @@ def main(argv=None):
     else:
         months = (args.months.split(",") if args.months else None)
         summary = sync(args.repo, months, args.work_dir,
-                       upload=args.upload)
+                       upload=args.upload,
+                       allow_partial_upload=args.allow_partial_upload)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
