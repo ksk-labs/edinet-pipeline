@@ -1,0 +1,51 @@
+name: gold
+
+# Gold 生成 (P2-T5、pipeline.gold) の運用ワークフロー。v2 データセットの
+# gold/ 配下への配置と日次差分更新を行う。
+# - build: 第1期 Silver (提出日 2021-11-01 以降) から全量を生成する。
+# - update: Silver の月の透かしと比較して変化した月を検出し、
+#   影響会社の行だけを再生成して差し替える (Silver 日次→Gold 日次の順序)。
+# 日次の定期実行への配線は、Silver 側の日次運転の観測と合わせて
+# 後続作業とする (本ワークフローは手動 dispatch の経路を用意する)。
+# 必要な秘密は HF_TOKEN のみ (入力の読み取りは公開データセットと
+# v2 上の登録簿の写しのため不要)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "実行するコマンド"
+        required: true
+        type: choice
+        options:
+          - build
+          - update
+
+jobs:
+  gold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run gold command
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          COMMAND: ${{ inputs.command }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/gold
+          python -m pipeline.gold "$COMMAND" \
+            --work-dir work/gold --upload \
+            | tee work/gold/result.json
+      - name: Upload run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gold-result
+          path: work/gold/result.json
+          if-no-files-found: ignore
