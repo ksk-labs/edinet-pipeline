@@ -55,7 +55,7 @@ jobs:
               echo "registry_yaml input is required for sync-registry" >&2
               exit 1
             fi
-            python -c "import os; open('work/gold/registry.yaml', 'w', encoding='utf-8').write(os.environ['REGISTRY_YAML'])"
+            python -c "import os, yaml; open('work/gold/registry.yaml', 'w', encoding='utf-8').write(os.environ['REGISTRY_YAML']); data = yaml.safe_load(open('work/gold/registry.yaml', encoding='utf-8')); assert isinstance(data, dict) and data.get('version') is not None, 'registry_yaml is empty or not a valid indicators.yaml'"
             python -m pipeline.gold sync-registry \
               --work-dir work/gold --upload \
               --registry-file work/gold/registry.yaml \
