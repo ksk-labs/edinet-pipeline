@@ -64,6 +64,28 @@ def sample_zip(date_jp="2026年11月17日", rows=None):
     return make_zip(make_csv_bytes(date_jp, rows))
 
 
+def sample_zip_cp932_only(date_jp="2026年11月17日"):
+    """提出者名に cp932 でなければ復号できないバイト列を含む zip。
+
+    会社名の先頭はバイト列 0xfb 0xfc で、cp932 では「髙」に復号できる
+    が厳密な Shift_JIS では復号できない (実ファイルの会社名に現れる
+    並び。2026-11-17 実測)。
+    """
+    lines = [
+        f"ダウンロード実行日,{date_jp}現在,件数,1件".encode("cp932"),
+        ",".join(COLUMNS).encode("cp932"),
+    ]
+    fields = []
+    for column, value in zip(COLUMNS, make_row("E00001")):
+        if column == "提出者名":
+            fields.append(b'"' + b"\xfb\xfc"
+                          + "松株式会社".encode("cp932") + b'"')
+        else:
+            fields.append(b'"' + value.encode("cp932") + b'"')
+    lines.append(b",".join(fields))
+    return make_zip(b"\r\n".join(lines) + b"\r\n")
+
+
 class ParseTest(unittest.TestCase):
     def test_parse_valid(self):
         snap = parse_codelist_zip(sample_zip())
@@ -105,6 +127,17 @@ class ParseTest(unittest.TestCase):
     def test_parse_not_zip_fails(self):
         with self.assertRaises(CodelistError):
             parse_codelist_zip(b"this is not a zip")
+
+    def test_parse_cp932_only_bytes(self):
+        zip_bytes = sample_zip_cp932_only()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            csv_bytes = zf.read("EdinetcodeDlInfo.csv")
+        self.assertIn(b"\xfb\xfc", csv_bytes)
+        with self.assertRaises(UnicodeDecodeError):
+            csv_bytes.decode("shift_jis")
+        snap = parse_codelist_zip(zip_bytes)
+        self.assertEqual(snap["by_code"]["E00001"]["提出者名"],
+                         "髙松株式会社")
 
 
 class DiffTest(unittest.TestCase):
@@ -183,11 +216,11 @@ class RunSnapshotTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.remote = {}
         self.api = FakeHfApi(self.remote)
-        download = make_hf_download(
+        self.download = make_hf_download(
             self.remote, os.path.join(self.tmp.name, "cache"))
         for p in [
             mock.patch.object(codelist, "HfApi", lambda: self.api),
-            mock.patch.object(codelist, "hf_hub_download", download),
+            mock.patch.object(codelist, "hf_hub_download", self.download),
         ]:
             p.start()
             self.addCleanup(p.stop)
@@ -298,6 +331,52 @@ class RunSnapshotTest(unittest.TestCase):
             any(p.startswith("codelist/date=") for p in self.remote))
         ledger = read_ledger(self.remote)
         self.assertEqual(ledger[0]["status"], "failed")
+
+    def test_diff_base_failure_still_saves_snapshot(self):
+        run_snapshot(self.work_dir("w1"), fetcher=lambda: sample_zip())
+        prev_path = "codelist/date=2026-11-17/EdinetcodeDlInfo.csv"
+
+        def flaky(repo_id, filename, repo_type="dataset", local_dir=None,
+                  token=None):
+            if filename == prev_path:
+                raise CodelistError("基準の取得に失敗 (テスト用の模擬)")
+            return self.download(repo_id, filename, repo_type=repo_type,
+                                 local_dir=local_dir, token=token)
+
+        rows = [make_row("E00001", capital="2000"),
+                make_row("E00003", name="第三株式会社")]
+        zip2 = sample_zip("2026年11月18日", rows)
+        with mock.patch.object(codelist, "hf_hub_download", flaky):
+            summary = run_snapshot(self.work_dir("w2"),
+                                   fetcher=lambda: zip2)
+        self.assertEqual(summary["status"], "ok")
+        base = "codelist/date=2026-11-18"
+        self.assertIn(f"{base}/EdinetcodeDlInfo.csv", self.remote)
+        self.assertIn(f"{base}/snapshot.json", self.remote)
+        self.assertIn("codelist/archive/Edinetcode-2026-11-18.zip",
+                      self.remote)
+        self.assertNotIn(f"{base}/diff.json", self.remote)
+        self.assertNotIn(f"{base}/changes.jsonl", self.remote)
+        self.assertEqual(summary["diff_status"], "pending")
+        self.assertIn("diff_error", summary)
+        ledger = read_ledger(self.remote)
+        self.assertEqual(ledger[-1]["status"], "ok")
+        self.assertEqual(ledger[-1]["diff_status"], "pending")
+
+        summary = run_snapshot(self.work_dir("w3"), fetcher=lambda: zip2)
+        self.assertEqual(summary["status"], "already_present")
+        self.assertEqual(summary["diff_status"], "generated")
+        self.assertEqual(summary["diff_base_date"], "2026-11-17")
+        diff = json.loads(self.remote[f"{base}/diff.json"].decode("utf-8"))
+        self.assertEqual(diff["base_date"], "2026-11-17")
+        self.assertEqual(
+            (diff["added"], diff["removed"], diff["changed"]), (1, 1, 1))
+
+        with mock.patch.object(codelist, "hf_hub_download", flaky):
+            summary = run_snapshot(self.work_dir("w4"),
+                                   fetcher=lambda: zip2)
+        self.assertEqual(summary["status"], "already_present")
+        self.assertEqual(summary["diff_status"], "present")
 
     def test_resume_completes_missing_products(self):
         zip_bytes = sample_zip()
