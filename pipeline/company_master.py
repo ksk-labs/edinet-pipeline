@@ -32,7 +32,11 @@ master/ の構成 (本モジュールが正本):
   で識別する (証券コード協議会の取扱い要領。0=普通株式、1=新株式、
   2=第二新株式、5・6=優先株式、3・4・7・8=その他の種類株式、
   9=新株予約権証券)。プレースホルダ 00000 は銘柄として数えず、
-  識別子履歴にだけ観測として残す。is_primary は主銘柄 (現行
+  識別子履歴にだけ観測として残す。先行ゼロの5桁コードはそのまま
+  では種類を判定しない: 回転形 (先行ゼロを末尾へ移した形) が同一
+  会社で観測されていれば表記ゆれとして回転形の銘柄へ観測を統合し、
+  観測されていなければ種類を「未確認」として review_items に残す
+  (security_kind_unverified)。is_primary は主銘柄 (現行
   スナップショットの証券コード。スナップショットに無い会社は
   最終観測日の最も新しいコード) で、primary_basis に根拠を持つ。
   コードリストの証券コードは提出者あたり1つだけなので、種類株の
@@ -58,7 +62,8 @@ master/ の構成 (本モジュールが正本):
 1 から連番で発行する。更新では新しいコードに既存の最大値+1 から
 昇順に発行し、既存の対応は変えない。意味は持たせない。
 
-法人番号による接続の規則 (仕様 §1 の精緻化。reconstruct_v1 と同じ):
+法人番号による接続の規則 (仕様 §1 の精緻化。reconstruct_v1 と同旨
+だが、再構成側は v1 索引に所在地の列が無いため名称のみで判定する):
 共有する法人番号が両側で複数行観測され、かつ両側の多数派であれば
 strong。多数派同士で、名称 (変更キー) または所在地が一致し、
 証券コードに矛盾が無ければ corroborated。それ以外は接続せず
@@ -152,6 +157,7 @@ SECURITY_KINDS = {
     "9": "新株予約権証券",
 }
 PLACEHOLDER_SEC_CODE = "00000"
+UNVERIFIED_KIND = "未確認"
 
 COMPANIES_SCHEMA = pa.schema([
     ("internal_id", pa.int64()),
@@ -297,6 +303,19 @@ def security_kind(code):
     return "不明", None
 
 
+def rotated_form(code):
+    """先行ゼロの5桁コードの回転形 (先行ゼロを末尾へ移した形) を返す。
+
+    対象はプレースホルダを除く5桁で先行ゼロを持つコードだけで、
+    それ以外は None を返す。回転形が実在するかは呼び出し側が
+    同一会社の観測集合で確認する。
+    """
+    if (code and len(code) == 5 and code[0] == "0"
+            and code != PLACEHOLDER_SEC_CODE):
+        return code[1:] + code[0]
+    return None
+
+
 def majority_value(counts):
     """観測回数が最大の値を返す。同数が複数あれば None (多数派なし)。
 
@@ -329,10 +348,6 @@ def evaluate_jcn_link(counts_a, counts_b, shared_jcn, name_agree,
         return "corroborated"
     return None
 
-
-# ---------------------------------------------------------------------------
-# コードリスト CSV の読み込み
-# ---------------------------------------------------------------------------
 
 def parse_codelist_csv(csv_bytes):
     """スナップショットの CSV バイト列を (日付, 行のリスト) にする。
@@ -376,10 +391,6 @@ def load_local_snapshots(snapshots_dir):
         found[date] = rows
     return sorted(found.items())
 
-
-# ---------------------------------------------------------------------------
-# 状態 (master の表群) の構築と更新
-# ---------------------------------------------------------------------------
 
 def empty_state(generated_at):
     return {
@@ -504,12 +515,32 @@ def state_from_history(history_dir, generated_at):
             **_provenance(V1_SOURCE_KIND, _v1_source_id(h), generated_at,
                           sha256=h["source_file_sha256"]),
         })
+    observed_secs = collections.defaultdict(set)
+    for h in history:
         if h["kind"] == "securities_code" and not h["is_placeholder"]:
-            kind_label, digit = security_kind(h["value"])
-            state["securities"].append({
-                "internal_id": internal_id_of[group_of[h["edinet_code"]]],
-                "edinet_code": h["edinet_code"],
-                "securities_code": h["value"], "security_kind": kind_label,
+            observed_secs[internal_id_of[group_of[h["edinet_code"]]]].add(
+                h["value"])
+    merged_secs = {}
+    unverified_secs = []
+    for h in history:
+        if h["kind"] != "securities_code" or h["is_placeholder"]:
+            continue
+        iid = internal_id_of[group_of[h["edinet_code"]]]
+        rot = rotated_form(h["value"])
+        if rot is not None and rot in observed_secs[iid]:
+            effective = rot
+        else:
+            effective = h["value"]
+        row = merged_secs.get((iid, effective))
+        if row is None:
+            if rot is not None and effective == h["value"]:
+                kind_label, digit = UNVERIFIED_KIND, None
+                unverified_secs.append((iid, h))
+            else:
+                kind_label, digit = security_kind(effective)
+            merged_secs[(iid, effective)] = {
+                "internal_id": iid, "edinet_code": h["edinet_code"],
+                "securities_code": effective, "security_kind": kind_label,
                 "reserve_digit": digit, "is_primary": False,
                 "primary_basis": None,
                 "first_observed_date": h["first_observed_date"],
@@ -517,7 +548,16 @@ def state_from_history(history_dir, generated_at):
                 "observation_count": int(h["observation_count"]),
                 "in_latest_snapshot": False,
                 **_provenance(V1_SOURCE_KIND, _v1_source_id(h), generated_at),
-            })
+            }
+        else:
+            row["observation_count"] += int(h["observation_count"])
+            row["first_observed_date"] = min(row["first_observed_date"],
+                                             h["first_observed_date"])
+            row["last_observed_date"] = max(row["last_observed_date"],
+                                            h["last_observed_date"])
+            if h["value"] == effective:
+                row["edinet_code"] = h["edinet_code"]
+    state["securities"].extend(merged_secs.values())
     for r in review:
         a, b = r["edinet_code_a"], r["edinet_code_b"]
         state["review_items"].append({
@@ -527,6 +567,19 @@ def state_from_history(history_dir, generated_at):
             "edinet_code_a": a, "edinet_code_b": b,
             "shared_value": r["shared_value"], "detail": r["detail"],
             **_provenance(V1_SOURCE_KIND, _v1_source_id(r), generated_at),
+        })
+    for iid, h in unverified_secs:
+        state["review_items"].append({
+            "item_type": "security_kind_unverified",
+            "internal_id_a": iid, "internal_id_b": None,
+            "edinet_code_a": h["edinet_code"], "edinet_code_b": None,
+            "shared_value": h["value"],
+            "detail": (f"証券コード {h['value']} は先行ゼロの5桁コードであり、"
+                       f"回転形 {rotated_form(h['value'])} が同一会社で"
+                       "観測されないため、種類を断定せず未確認として記録する。"
+                       "裏取り (銘柄名・有報の種類株式の内容) は書類側の"
+                       "取り込み後に行う。"),
+            **_provenance(V1_SOURCE_KIND, _v1_source_id(h), generated_at),
         })
     last_sub_path = os.path.join(history_dir, "last_submissions.parquet")
     if os.path.exists(last_sub_path):
@@ -771,8 +824,15 @@ def _apply_code_observation(state, indexes, code, row, date, generated_at):
                  })
     sec = (row[SEC_COLUMN] or "").strip()
     if sec and sec != PLACEHOLDER_SEC_CODE:
-        kind_label, digit = security_kind(sec)
-        target = indexes.sec.get((iid, sec))
+        effective = sec
+        unverified = False
+        rot = rotated_form(sec)
+        if rot is not None:
+            if (iid, rot) in indexes.sec:
+                effective = rot
+            else:
+                unverified = True
+        target = indexes.sec.get((iid, effective))
         if target is not None:
             target["last_observed_date"] = date
             target["observation_count"] += 1
@@ -782,16 +842,26 @@ def _apply_code_observation(state, indexes, code, row, date, generated_at):
                 # 観測元のコードを最新のものへ寄せる (行は会社単位で1つ)。
                 target["edinet_code"] = code
         else:
+            kind_label, digit = (UNVERIFIED_KIND, None) if unverified \
+                else security_kind(effective)
             new_row = {
                 "internal_id": iid, "edinet_code": code,
-                "securities_code": sec, "security_kind": kind_label,
+                "securities_code": effective, "security_kind": kind_label,
                 "reserve_digit": digit, "is_primary": False,
                 "primary_basis": None, "first_observed_date": date,
                 "last_observed_date": date, "observation_count": 1,
                 "in_latest_snapshot": True, **prov,
             }
             state["securities"].append(new_row)
-            indexes.sec[(iid, sec)] = new_row
+            indexes.sec[(iid, effective)] = new_row
+            if unverified:
+                _add_review(
+                    state, indexes, "security_kind_unverified", code, None,
+                    sec,
+                    f"証券コード {sec} は先行ゼロの5桁コードであり、回転形 "
+                    f"{rot} が同一会社で観測されないため、種類を断定せず"
+                    "未確認として記録する。裏取り (銘柄名・有報の種類株式の"
+                    "内容) は書類側の取り込み後に行う。", generated_at)
 
 
 def apply_snapshot(state, rows, date, generated_at):
@@ -901,10 +971,6 @@ def apply_new_snapshots(state, snapshots, generated_at):
     return applied
 
 
-# ---------------------------------------------------------------------------
-# 状態の読み書きとサマリ
-# ---------------------------------------------------------------------------
-
 def write_state(state, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     for name, schema in TABLE_SCHEMAS.items():
@@ -964,10 +1030,6 @@ def _group_by(rows, field):
         groups[r[field]].append(r)
     return groups.items()
 
-
-# ---------------------------------------------------------------------------
-# place-history: v1 再構成の実行と master/history_from_v1/ への配置
-# ---------------------------------------------------------------------------
 
 def compute_last_submissions(index_path, source_sha, generated_at):
     """v1 索引から (EDINET コード, 書類種別) ごとの最終提出日を集計する。
@@ -1043,10 +1105,6 @@ def place_history(work_dir, repo=DEFAULT_REPO, index_path=None, upload=False):
             "reconstruction": recon_summary,
             "last_submissions_rows": len(rows)}
 
-
-# ---------------------------------------------------------------------------
-# HF からの入力取得と master の upload
-# ---------------------------------------------------------------------------
 
 _SNAPSHOT_PATH_RE = re.compile(
     r"^codelist/date=(\d{4}-\d{2}-\d{2})/EdinetcodeDlInfo\.csv$")
@@ -1136,10 +1194,6 @@ def upload_master(state, out_dir, repo):
         uploaded.append(f"{MASTER_PREFIX}/{name}")
     return uploaded
 
-
-# ---------------------------------------------------------------------------
-# build / update
-# ---------------------------------------------------------------------------
 
 def corroboration_checks(connections, latest_rows):
     """接続候補を現行スナップショットで裏取りした結果を返す。
