@@ -46,6 +46,8 @@ def _prefix(month):
 def _retryable(exc):
     """一時的な失敗 (429 / 5xx / 接続エラー) だけを再試行対象にする。"""
     status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
     if status is not None:
         return status == 429 or status >= 500
     return isinstance(exc, OSError)

@@ -44,6 +44,8 @@ from zoneinfo import ZoneInfo
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError
 
+from .hf_sync import _with_retry
+
 API_BASE = "https://api.edinet-fsa.go.jp/api/v2"
 DEFAULT_REPO = "Yoshi-Dai/financial-lakehouse-v2"
 
@@ -56,6 +58,9 @@ ARTIFACTS = (
     ("english", 4, "englishDocFlag", ".zip"),
 )
 _KIND_BY_NAME = {a[0]: a for a in ARTIFACTS}
+
+# 書類取得 API の type ごとの応答の先頭バイト (保存前の形式検証用)。
+_FORMAT_HEADS = {1: b"PK", 2: b"%PDF", 3: b"PK", 4: b"PK"}
 
 # 出所 (成果物に持たせる。仕様 §3)。
 SOURCE_KIND = "edinet_api"
@@ -74,31 +79,37 @@ def _retryable_status(status):
     return status == 429 or status >= 500
 
 
-def _with_retry(what, fn):
-    """一時的な失敗 (429 / 5xx / 接続エラー) を指数バックオフで再試行する。
+def _body_status_code(body):
+    """HTTP 200 で返る JSON エラー応答の StatusCode を返す。
 
-    pipeline.hf_sync と同じ方針 (対象と間隔) を EDINET 側にも適用する。
+    書類取得 API のエラーは HTTP 200 のまま JSON ボディで返る
+    (EDINET API 仕様書 (Version 2) 3-3)。成功応答 (バイナリ、または
+    トップレベルに StatusCode を持たない一覧の JSON) では None を返す。
     """
-    delays = (5, 15, 30, 60, 120)
-    for attempt in range(len(delays) + 1):
-        try:
-            return fn()
-        except _RetryableHttpError as exc:
-            if attempt == len(delays):
-                raise
-            print(f"{what}: retry {attempt + 1} after error: {exc}",
-                  file=sys.stderr)
-            time.sleep(delays[attempt])
-        except (urllib.error.URLError, OSError) as exc:
-            if attempt == len(delays):
-                raise
-            print(f"{what}: retry {attempt + 1} after error: {exc!r}",
-                  file=sys.stderr)
-            time.sleep(delays[attempt])
+    head = body[:512].lstrip()
+    if not head.startswith(b"{") or b"StatusCode" not in head:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or "StatusCode" not in data:
+        return None
+    try:
+        return int(data["StatusCode"])
+    except (TypeError, ValueError):
+        return None
 
 
 class _RetryableHttpError(Exception):
-    """429 / 5xx の応答。再試行の対象であることを示す内部例外。"""
+    """429 / 5xx の応答。再試行の対象であることを示す内部例外。
+
+    hf_sync._retryable がステータスで判定できるよう status_code を持つ。
+    """
+
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.status_code = status
 
 
 class EdinetError(Exception):
@@ -147,7 +158,16 @@ class EdinetClient:
             self._last_at = time.monotonic()
             self.request_count += 1
         if _retryable_status(status):
-            raise _RetryableHttpError(f"HTTP {status}")
+            raise _RetryableHttpError(status)
+        if status == 200:
+            code = _body_status_code(body)
+            if code is not None and code != 200:
+                if _retryable_status(code):
+                    raise _RetryableHttpError(code)
+                raise EdinetError(
+                    "EDINET API のエラー応答です: "
+                    f"StatusCode {code}: "
+                    + self._sanitize(body[:200]))
         return status, ctype, body
 
     def _get(self, url, params):
@@ -176,8 +196,9 @@ class EdinetClient:
     def fetch_document(self, doc_id, type_):
         """書類の原形 (type=1..4) を取得してバイト列を返す。
 
-        書類が無い・不開示などの場合は API が JSON のエラー応答を返す
-        ため、Content-Type で判定して EdinetError にする。
+        エラー応答 (HTTP 200 + JSON ボディの StatusCode) は _get_once で
+        判定する。ここでは Content-Type が JSON の応答と、種別の形式
+        (先頭バイト) に合わない応答を EdinetError にする。
         """
         status, ctype, body = self._get(
             f"{API_BASE}/documents/{doc_id}",
@@ -190,10 +211,13 @@ class EdinetClient:
             raise EdinetError(
                 "書類の取得が JSON のエラー応答でした: "
                 + self._sanitize(body[:200]))
+        head = _FORMAT_HEADS.get(type_)
+        if head is not None and not body.startswith(head):
+            raise EdinetError(
+                f"書類の取得応答が想定した形式ではありません (type={type_}): "
+                + self._sanitize(body[:200]))
         return body
 
-
-# ---------------------------------------------------------------- 目録
 
 class JsonlLedger:
     """追記型の JSONL 目録。キーの最新行が状態 (pipeline.batch と同じ型)。
@@ -262,8 +286,6 @@ def catalog_row(doc, fetched_at):
     return row
 
 
-# ---------------------------------------------------------------- HF 同期
-
 def _download_if_exists(api, repo, path_in_repo, local_path):
     """HF 上のファイルを落とす。無ければ False。"""
     try:
@@ -294,8 +316,6 @@ def _upload_folder(api, repo, local_dir, path_in_repo, message):
         folder_path=local_dir, repo_id=repo, repo_type="dataset",
         path_in_repo=path_in_repo, commit_message=message))
 
-
-# ---------------------------------------------------------------- 実行
 
 def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
                     max_docs=None, kinds=None):
@@ -353,8 +373,9 @@ def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
 
     # 原形の取得 (書類単位で失敗を隔離する)
     wanted = [k for k in _KIND_BY_NAME if kinds is None or k in kinds]
-    staged = {}  # kind -> stage のサブディレクトリ
-    new_entries = []
+    staged_dirs = {}  # 保存先ディレクトリ (repo 側) -> ローカルのディレクトリ
+    ok_entries = []
+    failed_entries = []
     for doc in results:
         doc_id = doc.get("docID")
         if not doc_id:
@@ -385,7 +406,7 @@ def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
             try:
                 body = client.fetch_document(doc_id, type_)
             except Exception as e:  # 1書類の失敗で全体を止めない
-                new_entries.append({
+                failed_entries.append({
                     "doc_id": doc_id, "kind": kind, "status": "failed",
                     "error_kind": type(e).__name__,
                     "error": client._sanitize(f"{e}")[:500],
@@ -400,8 +421,8 @@ def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
             os.makedirs(os.path.dirname(local), exist_ok=True)
             with open(local, "wb") as f:
                 f.write(body)
-            staged.setdefault(kind, os.path.dirname(local))
-            new_entries.append({
+            staged_dirs[os.path.dirname(path)] = os.path.dirname(local)
+            ok_entries.append({
                 "doc_id": doc_id, "kind": kind, "status": "ok",
                 "sha256": sha256_bytes(body), "size": len(body),
                 "path": path,
@@ -411,13 +432,30 @@ def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
             })
             summary["downloaded"] += 1
 
-    # 原形のアップロード (種別ごと。済んでから目録を push する)
-    for kind, subdir in sorted(staged.items()):
-        # stage 配下のパスから repo 側のプレフィックスを復元する
-        rel = os.path.relpath(subdir, stage_dir)
-        _upload_folder(api, repo, subdir, rel.replace(os.sep, "/"),
+    # 原形のアップロード (保存先ディレクトリごと。済んでから目録を push する)
+    for rel_dir, local_dir in sorted(staged_dirs.items()):
+        kind = rel_dir.rsplit("/", 1)[-1]
+        _upload_folder(api, repo, local_dir, rel_dir,
                        f"discovery {date}: raw {kind}")
-    for entry in new_entries:
+
+    # 目録の ok は、アップロード後に遠隔で実在を確認できた分だけ書く
+    if ok_entries:
+        remote_after = _remote_files(api, repo)
+        for entry in ok_entries:
+            if entry["path"] in remote_after:
+                acq.append(entry)
+                continue
+            acq.append({
+                "doc_id": entry["doc_id"], "kind": entry["kind"],
+                "status": "failed", "error_kind": "upload_unconfirmed",
+                "error": "アップロード後に遠隔で実在を確認できませんでした",
+                "path": entry["path"], "updated_at": _now(),
+            })
+            summary["failed"] += 1
+            summary["failures"].append(
+                {"doc_id": entry["doc_id"], "kind": entry["kind"],
+                 "error_kind": "upload_unconfirmed"})
+    for entry in failed_entries:
         acq.append(entry)
 
     # 目録と実行サマリの push
@@ -433,7 +471,7 @@ def run_acquisition(date, work_dir, repo=DEFAULT_REPO, client=None,
                  f"acquisition/month={month}/ledger.jsonl",
                  f"discovery {date}: acquisition ledger")
     _upload_file(api, repo, summary_path,
-                 f"acquisition/month={month}/run_summary.json",
+                 f"acquisition/month={month}/run_summary-{date}-{stamp}.json",
                  f"discovery {date}: run summary")
     return summary
 
