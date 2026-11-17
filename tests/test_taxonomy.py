@@ -6,8 +6,10 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -266,6 +268,257 @@ class ArelleTest(unittest.TestCase):
             ["2013-08-31", "2026-11-01"], info)
         self.assertFalse(report["ok"])
         self.assertEqual(report["missing"], ["2026-11-01"])
+
+
+class SplitCandidateTest(unittest.TestCase):
+    """分割候補 (S1): 日本語ラベルの包含+同一接頭辞+追加2件以上。"""
+
+    def setUp(self):
+        self.old = parse_taxonomy_zip(make_taxonomy_zip())["elements"]
+
+    def test_split_candidate_and_judgment(self):
+        new = parse_taxonomy_zip(make_taxonomy_zip(
+            drop=("CashAndDeposits",),
+            extra_elements=[
+                ("CashAndDepositsDomestic", "現金及び預金（国内）",
+                 "Cash and deposits (domestic)"),
+                ("CashAndDepositsOverseas", "現金及び預金（海外）",
+                 "Cash and deposits (overseas)"),
+            ]))["elements"]
+        diff = compute_diff(
+            self.old, new,
+            indicator_elements=["jppfs_cor:CashAndDeposits"])
+        self.assertEqual(diff["counts"]["split_candidates"], 1)
+        cand = diff["split_candidates"][0]
+        self.assertEqual(cand["from"], "jppfs_cor:CashAndDeposits")
+        self.assertEqual(sorted(cand["to"]), [
+            "jppfs_cor:CashAndDepositsDomestic",
+            "jppfs_cor:CashAndDepositsOverseas"])
+        kinds = {(j["element"], j["kind"]) for j in diff["judgment_items"]}
+        self.assertIn(("jppfs_cor:CashAndDeposits", "split_candidate"),
+                      kinds)
+
+    def test_single_partial_match_is_not_split(self):
+        new = parse_taxonomy_zip(make_taxonomy_zip(
+            drop=("CashAndDeposits",),
+            extra_elements=[
+                ("CashAndDepositsDomestic", "現金及び預金（国内）",
+                 "Cash and deposits (domestic)"),
+            ]))["elements"]
+        diff = compute_diff(self.old, new)
+        self.assertEqual(diff["counts"]["split_candidates"], 0)
+
+
+class SemanticFieldsTest(unittest.TestCase):
+    def test_substitution_group_change_is_semantic(self):
+        old = parse_taxonomy_zip(make_taxonomy_zip())["elements"]
+        new = {k: dict(v) for k, v in old.items()}
+        new["jppfs_cor:CashAndDeposits"]["substitution_group"] = \
+            "xbrli:tuple"
+        diff = compute_diff(old, new)
+        self.assertIn("substitution_group",
+                      diff["changed"]["jppfs_cor:CashAndDeposits"])
+
+
+class FakeRemote:
+    """HF データセットの代役。保存経路の関数を差し替えて使う。"""
+
+    def __init__(self):
+        self.files = {}
+        self.uploads = []
+
+    def list_files(self, api, repo):
+        return set(self.files)
+
+    def download(self, api, repo, path_in_repo, local_path):
+        if path_in_repo not in self.files:
+            return False
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(self.files[path_in_repo])
+        return True
+
+    def upload(self, api, repo, local_path, path_in_repo, message):
+        with open(local_path, "rb") as f:
+            self.files[path_in_repo] = f.read()
+        self.uploads.append(path_in_repo)
+
+
+def make_fetcher(portal_html=PORTAL_HTML, zip_bytes=None, fail_zip=False):
+    def fetch(url):
+        if url == taxonomy.LIST_PAGE_URL:
+            return LIST_PAGE_HTML.encode()
+        if url == taxonomy.PORTAL_URL:
+            return portal_html.encode()
+        if url == taxonomy.COUNCIL_PAGE_URL:
+            return COUNCIL_HTML.encode()
+        if "codestock_" in url:
+            return b"%PDF-fake"
+        if url == taxonomy.ARELLE_UPSTREAM_URL:
+            return ArelleTest.XML
+        if url.endswith("1c_Taxonomy.zip"):
+            if fail_zip:
+                raise TaxonomyError("zip の取得に失敗しました (代役)")
+            return zip_bytes
+        raise AssertionError(f"想定外の URL: {url}")
+    return fetch
+
+
+class OrchestrationBase(unittest.TestCase):
+    def setUp(self):
+        self.remote = FakeRemote()
+        self.work = tempfile.mkdtemp(prefix="taxonomy-test-")
+        arelle_info = parse_arelle_taxonomies(ArelleTest.XML)
+        self._patches = [
+            mock.patch.object(taxonomy, "HfApi", lambda *a, **k: object()),
+            mock.patch.object(taxonomy, "_remote_files",
+                              self.remote.list_files),
+            mock.patch.object(taxonomy, "_download_if_exists",
+                              self.remote.download),
+            mock.patch.object(taxonomy, "_upload_file", self.remote.upload),
+            mock.patch.object(
+                taxonomy, "load_arelle_taxonomies",
+                lambda fetcher=None: (arelle_info, "test:fake")),
+        ]
+        for p in self._patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patches])
+
+
+class CheckOrchestrationTest(OrchestrationBase):
+    def test_check_does_not_consume_detection(self):
+        # M1 の回帰: 確認のみを繰り返しても、取込済みでない最新版は
+        # 検出され続ける (state の latest_edition が進んでも消費されない)。
+        fetcher = make_fetcher()
+        first = taxonomy.run_check(self.work, fetcher=fetcher)
+        self.assertEqual(first["new_edition"]["edition"], 2026)
+        state = json.loads(self.remote.files["taxonomy/state.json"])
+        self.assertEqual(state["latest_edition"], 2026)
+        self.assertEqual(state["ingested_editions"], [])
+        second = taxonomy.run_check(self.work, fetcher=fetcher)
+        self.assertEqual(second["new_edition"]["edition"], 2026)
+        # リモートに版の meta があれば取込済みとして検出は止まる。
+        self.remote.files["taxonomy/edition=2026/meta.json"] = b"{}"
+        third = taxonomy.run_check(self.work, fetcher=fetcher)
+        self.assertIsNone(third["new_edition"])
+
+    def test_portal_empty_is_failed_source(self):
+        # M2 の回帰: ポータルの抽出が0件なら failed_sources に残る。
+        fetcher = make_fetcher(portal_html="<html>no downloads</html>")
+        result = taxonomy.run_check(self.work, fetcher=fetcher)
+        sources = {s["source"] for s in result["failed_sources"]}
+        self.assertIn("portal", sources)
+        self.assertIsNotNone(result["list_page"])
+        self.assertEqual(result["new_edition"]["edition"], 2026)
+
+    def test_failed_source_is_isolated(self):
+        def fetch(url):
+            if url == taxonomy.COUNCIL_PAGE_URL:
+                raise RuntimeError("council down (fake)")
+            return make_fetcher()(url)
+        result = taxonomy.run_check(self.work, fetcher=fetch)
+        self.assertEqual([s["source"] for s in result["failed_sources"]],
+                         ["council"])
+        self.assertIsNotNone(result["portal"])
+
+
+class IngestOrchestrationTest(OrchestrationBase):
+    def setUp(self):
+        super().setUp()
+        self.zip2026 = make_taxonomy_zip(date="2025-11-01")
+
+    def test_ingest_ok_then_already_present(self):
+        first = taxonomy.run_ingest(self.work, 2026, self.zip2026)
+        self.assertEqual(first["status"], "ok")
+        paths = taxonomy.edition_paths(2026)
+        for key in ("archive", "elements", "meta"):
+            self.assertIn(paths[key], self.remote.files)
+        self.remote.uploads.clear()
+        second = taxonomy.run_ingest(self.work, 2026, self.zip2026)
+        self.assertEqual(second["status"], "already_present")
+        # 版の成果物は再送されない (目録への追記だけが行われる)。
+        self.assertEqual(self.remote.uploads, ["taxonomy/ledger.jsonl"])
+
+    def test_conflict_on_different_zip(self):
+        taxonomy.run_ingest(self.work, 2026, self.zip2026)
+        other = make_taxonomy_zip(
+            date="2025-11-01",
+            extra_elements=[("ExtraThing", "追加要素", "Extra thing")])
+        result = taxonomy.run_ingest(self.work, 2026, other)
+        self.assertEqual(result["status"], "conflict")
+
+    def test_partial_elements_mismatch_is_conflict(self):
+        # S8 の回帰: elements だけが別内容で先行保存された部分状態では、
+        # meta だけを新内容で書かず競合にする。
+        paths = taxonomy.edition_paths(2026)
+        self.remote.files[paths["elements"]] = b"unrelated\n"
+        result = taxonomy.run_ingest(self.work, 2026, self.zip2026)
+        self.assertEqual(result["status"], "conflict")
+        self.assertNotIn(paths["meta"], self.remote.files)
+
+    def test_partial_elements_match_completes(self):
+        paths = taxonomy.edition_paths(2026)
+        elements = parse_taxonomy_zip(self.zip2026)["elements"]
+        text = "".join(json.dumps(elements[k], ensure_ascii=False) + "\n"
+                       for k in sorted(elements))
+        self.remote.files[paths["elements"]] = text.encode("utf-8")
+        result = taxonomy.run_ingest(self.work, 2026, self.zip2026)
+        self.assertEqual(result["status"], "ok")
+        self.assertIn(paths["meta"], self.remote.files)
+        self.assertNotIn(paths["elements"], self.remote.uploads)
+
+    def test_diff_pending_then_completed_on_retry(self):
+        # S2 の回帰: 差分の生成失敗は警報と目録に pending として残り、
+        # 次回の取込 (already_present) で補完される。
+        zip2025 = make_taxonomy_zip(date="2024-11-01")
+        taxonomy.run_ingest(self.work, 2025, zip2025)
+
+        def boom(old, new, indicator_elements=()):
+            raise RuntimeError("diff boom (fake)")
+        with mock.patch.object(taxonomy, "compute_diff", boom):
+            failed = taxonomy.run_ingest(self.work, 2026, self.zip2026)
+        self.assertEqual(failed["status"], "ok")
+        self.assertEqual(failed["diff_status"], "pending")
+        self.assertIn("diff_pending",
+                      {a["kind"] for a in failed["alerts"]})
+        ledger = self.remote.files["taxonomy/ledger.jsonl"].decode()
+        self.assertIn('"diff_status": "pending"', ledger)
+        paths = taxonomy.edition_paths(2026)
+        self.assertNotIn(paths["diff"], self.remote.files)
+
+        retried = taxonomy.run_ingest(self.work, 2026, self.zip2026)
+        self.assertEqual(retried["status"], "already_present")
+        self.assertEqual(retried["diff_status"], "generated")
+        self.assertIn(paths["diff"], self.remote.files)
+        self.assertIn(paths["changes"], self.remote.files)
+
+    def test_arelle_unavailable_is_alert(self):
+        # S3 の回帰: 取込時に arelle の有効一覧が取得できない場合は
+        # 無言で通さず警報にする。
+        with mock.patch.object(taxonomy, "load_arelle_taxonomies",
+                               lambda fetcher=None: (None, None)):
+            result = taxonomy.run_ingest(self.work, 2026, self.zip2026)
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("arelle_unavailable",
+                      {a["kind"] for a in result["alerts"]})
+
+
+class RunAllOrchestrationTest(OrchestrationBase):
+    def test_failed_zip_fetch_is_retried_next_run(self):
+        # M1 の回帰 (統括経路): check のみの実行で検出は消費されず、
+        # ZIP 取得が失敗した run の翌回に再検出・再取込される。
+        zip2026 = make_taxonomy_zip(date="2025-11-01")
+        failing = make_fetcher(zip_bytes=zip2026, fail_zip=True)
+        checked = taxonomy.run_check(self.work, fetcher=failing)
+        self.assertEqual(checked["new_edition"]["edition"], 2026)
+        with self.assertRaises(TaxonomyError):
+            taxonomy.run_all(self.work, fetcher=failing)
+        working = make_fetcher(zip_bytes=zip2026)
+        summary = taxonomy.run_all(self.work, fetcher=working)
+        self.assertEqual(summary["ingest"]["status"], "ok")
+        again = taxonomy.run_all(self.work, fetcher=working)
+        self.assertIsNone(again["check"]["new_edition"])
+        self.assertIsNone(again["ingest"])
 
 
 if __name__ == "__main__":
