@@ -318,10 +318,7 @@ def run_acquire(index_path, work_dir, repo=DEFAULT_REPO, client=None,
                 summary["failed_doc_ids"].append(entry["doc_id"])
         for entry in failed_entries:
             acq.append(entry)
-        # 取得目録への追記が0件で遠隔目録も無い月は、ローカルの
-        # state ファイル自体が存在しない。上げるものが無いので
-        # push を行わない（max_docs で上限に達し次の月に到達した
-        # 場合に当たる。JsonlLedger は初回追記時にだけファイルを作る）。
+        # 追記0件で遠隔目録も無い月は state ファイル自体が無い
         if os.path.exists(acq_local):
             push_acquisition_ledger()
         if summary["stopped_early"]:
