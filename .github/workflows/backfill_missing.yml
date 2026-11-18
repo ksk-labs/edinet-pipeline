@@ -1,0 +1,200 @@
+name: backfill_missing
+
+# S2-T6 (Issue #26) v1 未収穫 250 件の補完取得と Silver への追加。
+# 第1期バックフィル (S2-T2) の全数照合で確定した、xbrl_flag=true
+# なのに v1 に実ファイルが無い書類を EDINET API から取得する。
+# - acquire: pipeline.backfill_missing が固定リビジョンの v1 索引から
+#   対象を確定し、書類目録 (catalog/) と原形 (raw/) と取得目録
+#   (acquisition/) を v2 データセットへ保存する。取得できない書類は
+#   取得目録へ理由つきで記録される (黙って落とさない)。
+# - plan / parse / merge: 日次解析 (daily_parse.yml) と同じ3段階で、
+#   取得できた書類だけを arelle で解析して Silver へ追記する。
+#   plan は acquire が出力した書類 ID 一覧で対象を指定する。
+# - 冪等: 取得目録が ok で原形が実在する書類は再取得せず、解析済みの
+#   判定も日次経路と同じ (解析目録 ok + zip の SHA-256 一致)。
+#   途中まで進んだ状態で再実行しても続きから進む。
+# - workflow_dispatch のみ (定期実行はしない一回限りの補完)。
+#   max_docs は動作確認用 (acquire の試行上限)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_docs:
+        description: "acquire で試行する書類数の上限 (空なら無制限。動作確認用)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      acquired: ${{ steps.acquire.outputs.acquired }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download pinned index from HF v1 (read-only)
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          curl -fL --retry 5 --retry-all-errors --retry-delay 5 -o work/index.parquet \
+            "https://huggingface.co/datasets/Yoshi-Dai/financial-lakehouse/resolve/43540407ea82f792551e145598b1cf50cde6cb78/catalog/documents_index.parquet"
+          echo "68a8c01ea8cc1c952eeeb4b3b1eebf2dd52a3b56b511c45a8f9154b601512997  work/index.parquet" | sha256sum -c -
+      - name: Run acquisition
+        id: acquire
+        env:
+          EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MAX_DOCS: ${{ inputs.max_docs }}
+        run: |
+          set -euo pipefail
+          args=(--index work/index.parquet --work-dir work/acquire)
+          if [ -n "$MAX_DOCS" ]; then args+=(--max-docs "$MAX_DOCS"); fi
+          python -m pipeline.backfill_missing run "${args[@]}"
+          acquired=$(cat work/acquire/out/acquired_doc_ids.txt)
+          echo "acquired=$acquired" >> "$GITHUB_OUTPUT"
+          echo "acquired_count=$(tr ',' '\n' <<< "$acquired" | grep -c . || true)"
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-missing-acquire
+          path: |
+            work/acquire/state/*.jsonl
+            work/acquire/out/run_summary.json
+            work/acquire/out/acquired_doc_ids.txt
+          if-no-files-found: warn
+
+  plan:
+    needs: acquire
+    if: needs.acquire.outputs.acquired != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+      shard_list: ${{ steps.plan.outputs.shard_list }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Build plan
+        id: plan
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DOC_IDS: ${{ needs.acquire.outputs.acquired }}
+        run: |
+          set -euo pipefail
+          python -m pipeline.parse plan --work-dir work/plan \
+            --doc-ids "$DOC_IDS"
+          python - <<'PY'
+          import json, os
+          plan = json.load(open("work/plan/plan.json", encoding="utf-8"))
+          targets = len(plan["docs"])
+          n = max(1, min(4, targets)) if targets else 0
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"targets={targets}\n")
+              f.write(f"shard_list={json.dumps(list(range(n)))}\n")
+          print(f"targets={targets} shards={n}")
+          PY
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: work/plan/plan.json
+
+  parse:
+    needs: plan
+    if: needs.plan.outputs.targets != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shard_list) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install arelle-release==2.47.5
+      - name: Restore taxonomy cache
+        uses: actions/cache@v4
+        with:
+          path: work/webcache
+          key: arelle-webcache-2.47.5-v1
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: work/dl-plan
+      - name: Parse shard
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SHARD: ${{ matrix.shard }}
+          SHARD_LIST: ${{ needs.plan.outputs.shard_list }}
+        run: |
+          set -euo pipefail
+          shards=$(python -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$SHARD_LIST")
+          python -m pipeline.parse shard \
+            --plan work/dl-plan/plan.json \
+            --shard "$SHARD" --shards "$shards" \
+            --work-dir work/parse \
+            --webcache-dir work/webcache
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: work/parse/shard-${{ matrix.shard }}
+          if-no-files-found: warn
+
+  merge:
+    needs: [plan, parse]
+    if: needs.plan.outputs.targets != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: work/dl-plan
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: work/dl-shards
+      - name: Merge into Silver
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python -m pipeline.parse merge \
+            --plan work/dl-plan/plan.json \
+            --shards-dir work/dl-shards \
+            --work-dir work/merge | tee work/merge-summary.json
+      - name: Upload merge evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parse-merge-evidence
+          path: work/merge-summary.json
+          if-no-files-found: warn
