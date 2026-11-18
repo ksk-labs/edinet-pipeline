@@ -10,6 +10,9 @@ name: gold
 #   ローカルの HF トークン (muse-ksk) には v2 への書き込み権限がなく
 #   ローカルでは実行できないため、Actions 経由が唯一の経路である。
 #   登録簿の内容は dispatch 時の registry_yaml 入力で渡す。
+# - since_month: build / update の対象開始月 (YYYY-MM)。空なら
+#   pipeline.gold の既定値 2021-11 (第1期) を使う。全期間の再生成は
+#   2016-03 を指定する (第2期 Silver を含む全129か月が対象になる)。
 # 日次の定期実行への配線は、Silver 側の日次運転の観測と合わせて
 # 後続作業とする (本ワークフローは手動 dispatch の経路を用意する)。
 # 必要な秘密は HF_TOKEN のみ (入力の読み取りは公開データセットと
@@ -30,6 +33,11 @@ on:
         description: "sync-registry の場合に同期する指標登録簿 (indicators.yaml) の全文"
         required: false
         type: string
+      since_month:
+        description: "build / update の対象開始月 YYYY-MM（空なら既定値 2021-11）"
+        required: false
+        default: ''
+        type: string
 
 jobs:
   gold:
@@ -47,6 +55,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           COMMAND: ${{ inputs.command }}
           REGISTRY_YAML: ${{ inputs.registry_yaml }}
+          SINCE_MONTH: ${{ inputs.since_month }}
         run: |
           set -euo pipefail
           mkdir -p work/gold
@@ -61,8 +70,16 @@ jobs:
               --registry-file work/gold/registry.yaml \
               | tee work/gold/result.json
           else
+            ARGS=()
+            if [ -n "$SINCE_MONTH" ]; then
+              if ! [[ "$SINCE_MONTH" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]; then
+                echo "since_month must be in YYYY-MM format: $SINCE_MONTH" >&2
+                exit 1
+              fi
+              ARGS+=(--since-month "$SINCE_MONTH")
+            fi
             python -m pipeline.gold "$COMMAND" \
-              --work-dir work/gold --upload \
+              --work-dir work/gold --upload "${ARGS[@]}" \
               | tee work/gold/result.json
           fi
       - name: Upload run summary
