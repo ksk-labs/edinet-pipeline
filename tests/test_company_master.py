@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,9 +15,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from pipeline.company_master import (
-    apply_new_snapshots, corroboration_checks, empty_state,
-    evaluate_jcn_link, majority_value, rotated_form, security_kind,
-    state_from_history,
+    aggregate_catalog_submissions, apply_new_snapshots,
+    corroboration_checks, empty_state, evaluate_jcn_link, majority_value,
+    refresh_last_submissions, rotated_form, run_update, security_kind,
+    state_from_history, write_state,
 )
 from pipeline.codelist import EXPECTED_COLUMNS
 
@@ -510,6 +512,223 @@ class StateRoundtripTest(unittest.TestCase):
         self.assertEqual(len(back["companies"]), 1)
         self.assertEqual(back["edinet_codes"][0]["edinet_code"], "E00020")
         self.assertEqual(next_id, 2)
+
+
+def catalog_row(doc_id, code, doc_type, submit):
+    return {"docID": doc_id, "edinetCode": code,
+            "docTypeCode": doc_type, "submitDateTime": submit}
+
+
+def last_sub_row(code, doc_type, last, count, iid=1):
+    return {"internal_id": iid, "edinet_code": code, "doc_type": doc_type,
+            "last_submit_date": last, "document_count": count,
+            "is_derived": True, "source_kind": "v1_index",
+            "source_id": "seed", "source_sha256": None,
+            "generated_at": GEN, "redistribution": "allowed"}
+
+
+class AggregateCatalogSubmissionsTest(unittest.TestCase):
+    def test_duplicate_observations_counted_once(self):
+        rows = [
+            catalog_row("S1", "E00001", "120", "2026-11-18 09:00:00"),
+            catalog_row("S1", "E00001", "120", "2026-11-18 09:00:00"),
+            catalog_row("S2", "E00001", "120", "2026-11-19 09:00:00"),
+        ]
+        agg = aggregate_catalog_submissions(rows)
+        a = agg[("E00001", "120")]
+        self.assertEqual(a["last"], "2026-11-19")
+        self.assertEqual(sum(a["by_date"].values()), 2)
+        self.assertEqual(a["by_date"]["2026-11-18"], 1)
+
+    def test_rows_without_doc_id_or_code_are_skipped(self):
+        rows = [
+            {"edinetCode": "E00001", "docTypeCode": "120",
+             "submitDateTime": "2026-11-18 09:00:00"},
+            {"docID": "S1", "docTypeCode": "120",
+             "submitDateTime": "2026-11-18 09:00:00"},
+            {"docID": "S2", "edinetCode": "E00001",
+             "docTypeCode": "120", "submitDateTime": ""},
+            catalog_row("S3", "E00001", "120", "2026-11-18 09:00:00"),
+        ]
+        agg = aggregate_catalog_submissions(rows)
+        self.assertEqual(sum(agg[("E00001", "120")]["by_date"].values()), 1)
+
+    def test_duplicate_with_different_dates_keeps_newest(self):
+        rows = [
+            catalog_row("S1", "E00001", "120", "2026-11-19 09:00:00"),
+            catalog_row("S1", "E00001", "120", "2026-11-17 09:00:00"),
+            catalog_row("S2", "E00001", "120", "2026-11-17 09:00:00"),
+            catalog_row("S2", "E00001", "120", "2026-11-18 09:00:00"),
+        ]
+        agg = aggregate_catalog_submissions(rows)
+        a = agg[("E00001", "120")]
+        self.assertEqual(a["last"], "2026-11-19")
+        self.assertEqual(dict(a["by_date"]),
+                         {"2026-11-19": 1, "2026-11-18": 1})
+
+
+class RefreshLastSubmissionsTest(unittest.TestCase):
+    def state_with_seed(self):
+        state = empty_state(GEN)
+        state["edinet_codes"].append({
+            "internal_id": 1, "edinet_code": "E00001"})
+        state["last_submissions"].append(
+            last_sub_row("E00001", "120", "2026-11-10", 5))
+        return state
+
+    def test_advances_date_and_counts_only_newer_docs(self):
+        state = self.state_with_seed()
+        agg = aggregate_catalog_submissions([
+            catalog_row("S1", "E00001", "120", "2026-11-09 09:00:00"),
+            catalog_row("S2", "E00001", "120", "2026-11-10 09:00:00"),
+            catalog_row("S3", "E00001", "120", "2026-11-12 09:00:00"),
+            catalog_row("S4", "E00001", "120", "2026-11-12 10:00:00"),
+        ])
+        stats = refresh_last_submissions(state, agg, GEN)
+        row = state["last_submissions"][0]
+        self.assertEqual(row["last_submit_date"], "2026-11-12")
+        self.assertEqual(row["document_count"], 7)
+        self.assertEqual(row["source_kind"], "edinet_api")
+        self.assertEqual(stats["updated_rows"], 1)
+        self.assertEqual(stats["added_documents"], 2)
+
+    def test_refresh_is_idempotent(self):
+        state = self.state_with_seed()
+        agg = aggregate_catalog_submissions([
+            catalog_row("S3", "E00001", "120", "2026-11-12 09:00:00"),
+        ])
+        refresh_last_submissions(state, agg, GEN)
+        before = dict(state["last_submissions"][0])
+        stats = refresh_last_submissions(state, agg, GEN)
+        self.assertEqual(state["last_submissions"][0], before)
+        self.assertEqual(stats["updated_rows"], 0)
+        self.assertEqual(stats["added_documents"], 0)
+
+    def test_new_key_for_known_code_creates_row(self):
+        state = self.state_with_seed()
+        agg = aggregate_catalog_submissions([
+            catalog_row("S1", "E00001", "130", "2026-11-15 09:00:00"),
+            catalog_row("S2", "E00001", "130", "2026-11-16 09:00:00"),
+        ])
+        stats = refresh_last_submissions(state, agg, GEN)
+        self.assertEqual(stats["new_rows"], 1)
+        row = [r for r in state["last_submissions"]
+               if r["doc_type"] == "130"][0]
+        self.assertEqual(row["document_count"], 2)
+        self.assertEqual(row["last_submit_date"], "2026-11-16")
+        self.assertEqual(row["internal_id"], 1)
+
+    def test_unknown_code_is_skipped_and_counted(self):
+        state = self.state_with_seed()
+        agg = aggregate_catalog_submissions([
+            catalog_row("S1", "E99999", "120", "2026-11-15 09:00:00"),
+        ])
+        stats = refresh_last_submissions(state, agg, GEN)
+        self.assertEqual(len(state["last_submissions"]), 1)
+        self.assertEqual(stats["unknown_codes"], 1)
+        self.assertEqual(stats["unknown_documents"], 1)
+
+    def test_no_new_docs_leaves_row_untouched(self):
+        state = self.state_with_seed()
+        agg = aggregate_catalog_submissions([
+            catalog_row("S1", "E00001", "120", "2026-11-01 09:00:00"),
+        ])
+        stats = refresh_last_submissions(state, agg, GEN)
+        row = state["last_submissions"][0]
+        self.assertEqual(row["document_count"], 5)
+        self.assertEqual(row["source_kind"], "v1_index")
+        self.assertEqual(stats["updated_rows"], 0)
+
+
+class RunUpdateCatalogTest(unittest.TestCase):
+    def test_update_applies_snapshots_and_refreshes_last_submissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_dir = os.path.join(tmp, "history")
+            build_history_dir(history_dir)
+            state = state_from_history(history_dir, GEN)
+            apply_new_snapshots(state, [(SNAP1_DATE, SNAP1)], GEN)
+            iid = [r for r in state["edinet_codes"]
+                   if r["edinet_code"] == "E00001"][0]["internal_id"]
+            state["last_submissions"].append(
+                last_sub_row("E00001", "120", "2026-11-10", 5, iid=iid))
+            state_dir = os.path.join(tmp, "state_in")
+            write_state(state, state_dir)
+            catalog = [
+                catalog_row("S900", "E00001", "120", "2026-11-19 09:00:00"),
+                catalog_row("S901", "E00001", "120", "2026-11-19 10:00:00"),
+                catalog_row("S902", "E00003", "120", "2026-11-19 09:30:00"),
+            ]
+            result = run_update(os.path.join(tmp, "work"),
+                                state_dir=state_dir,
+                                snapshots=[(SNAP2_DATE, SNAP2)],
+                                catalog_rows=catalog)
+            summary = result["summary"]
+            self.assertEqual(summary["last_applied_snapshot_date"],
+                             SNAP2_DATE)
+            self.assertEqual(
+                summary["last_submissions_refresh"]["added_documents"], 3)
+            self.assertEqual(summary["last_submissions_rows"], 2)
+            from pipeline.company_master import read_state
+            out = read_state(os.path.join(tmp, "work", "master_out"))
+            rows = {(r["edinet_code"], r["doc_type"]): r
+                    for r in out["last_submissions"]}
+            self.assertEqual(rows[("E00001", "120")]["document_count"], 7)
+            self.assertEqual(rows[("E00001", "120")]["last_submit_date"],
+                             "2026-11-19")
+            self.assertEqual(rows[("E00003", "120")]["document_count"], 1)
+
+    def seed_state_dir(self, tmp):
+        history_dir = os.path.join(tmp, "history")
+        build_history_dir(history_dir)
+        state = state_from_history(history_dir, GEN)
+        apply_new_snapshots(state, [(SNAP1_DATE, SNAP1)], GEN)
+        iid = [r for r in state["edinet_codes"]
+               if r["edinet_code"] == "E00001"][0]["internal_id"]
+        state["last_submissions"].append(
+            last_sub_row("E00001", "120", "2026-11-10", 5, iid=iid))
+        state_dir = os.path.join(tmp, "state_in")
+        write_state(state, state_dir)
+        return state_dir
+
+    def assert_snapshot_applied_despite_refresh_error(self, tmp, result):
+        from pipeline.company_master import read_state
+        summary = result["summary"]
+        self.assertEqual(summary["last_applied_snapshot_date"], SNAP2_DATE)
+        self.assertIn("error_kind",
+                      summary["last_submissions_refresh"])
+        self.assertEqual(summary["last_submissions_rows"], 1)
+        out = read_state(os.path.join(tmp, "work", "master_out"))
+        row = out["last_submissions"][0]
+        self.assertEqual(row["document_count"], 5)
+        self.assertEqual(row["last_submit_date"], "2026-11-10")
+
+    def test_update_survives_catalog_download_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = self.seed_state_dir(tmp)
+            with mock.patch(
+                    "pipeline.company_master.download_catalog_rows",
+                    side_effect=RuntimeError("catalog read failed")):
+                result = run_update(os.path.join(tmp, "work"),
+                                    state_dir=state_dir,
+                                    snapshots=[(SNAP2_DATE, SNAP2)])
+            self.assert_snapshot_applied_despite_refresh_error(tmp, result)
+            self.assertEqual(
+                result["summary"]["last_submissions_refresh"]["error_kind"],
+                "RuntimeError")
+
+    def test_update_survives_corrupt_catalog_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = self.seed_state_dir(tmp)
+            catalog = [{"docID": "S1", "edinetCode": "E00001",
+                        "docTypeCode": "120", "submitDateTime": 20261119}]
+            result = run_update(os.path.join(tmp, "work"),
+                                state_dir=state_dir,
+                                snapshots=[(SNAP2_DATE, SNAP2)],
+                                catalog_rows=catalog)
+            self.assert_snapshot_applied_despite_refresh_error(tmp, result)
+            self.assertEqual(
+                result["summary"]["last_submissions_refresh"]["error_kind"],
+                "TypeError")
 
 
 if __name__ == "__main__":

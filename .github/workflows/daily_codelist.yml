@@ -14,6 +14,14 @@ name: daily_codelist
 #   時刻の根拠は S2-T5-4 の作業記録。
 # - コードリストの取得に EDINET API キーは不要である (ダウンロード
 #   サイトの固定 URL)。必要な秘密は HF_TOKEN のみ。
+# - company-master-update (Issue #41): codelist ジョブの後段で会社
+#   マスタの update を実行する。needs で同一 run の後段に置くため、
+#   スケジューラ遅延の影響を受けず、保存されたスナップショットが
+#   そのまま適用される。update は未適用分だけを適用する冪等な処理
+#   であり、2回目の run では実質的に何もしない。手動 dispatch
+#   (company_master.yml) との競合は、concurrency グループ
+#   company-master-write (リポジトリ全体で有効) を共有し、
+#   cancel-in-progress: false と queue: max で直列化して防ぐ。
 
 on:
   schedule:
@@ -46,4 +54,38 @@ jobs:
           path: |
             work/codelist/state/ledger.jsonl
             work/codelist/out/run_summary.json
+          if-no-files-found: warn
+
+  company-master-update:
+    needs: codelist
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: company-master-write
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run company master update
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/master
+          python -m pipeline.company_master update \
+            --work-dir work/master --upload \
+            | tee work/master/result.json
+      - name: Upload run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: company-master-update-summary
+          path: |
+            work/master/result.json
+            work/master/master_out/summary.json
           if-no-files-found: warn

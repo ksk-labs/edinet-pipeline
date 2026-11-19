@@ -7,9 +7,13 @@ name: company_master
 #   初期構築の前に1回実行する (再実行は同じ入力からの再生成で冪等)。
 # - build: 初期履歴とコードリストの全スナップショットから会社マスタを
 #   構築し、master/ へ配置する。place-history の後に1回実行する。
-# - update: 現在の master/ へ未適用のスナップショットだけを適用する。
-#   日次の定期実行への配線 (daily_codelist への相乗り) は運用側の
-#   後続作業とし、本ワークフローは手動 dispatch の経路を用意する。
+# - update: 現在の master/ へ未適用のスナップショットだけを適用し、
+#   書類目録の集計で最終提出日 (last_submissions) を更新する。
+#   日次の定期実行は daily_codelist の後段ジョブ (company-master-
+#   update) が担い (Issue #41)、本ワークフローは手動 dispatch の
+#   経路である。手動実行と日次ジョブの競合は、concurrency グループ
+#   company-master-write (リポジトリ全体で有効) を共有し、
+#   cancel-in-progress: false と queue: max で直列化して防ぐ。
 # 必要な秘密は HF_TOKEN のみ (v1 索引と v2 データセットの読み取りは
 # 公開のため不要)。
 
@@ -29,6 +33,10 @@ jobs:
   company-master:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    concurrency:
+      group: company-master-write
+      cancel-in-progress: false
+      queue: max
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

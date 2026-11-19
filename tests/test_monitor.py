@@ -325,5 +325,51 @@ class ParseIssuesTest(MonitorTestBase):
         self.assertEqual(report["signals"]["parse_ok_today"], 0)
 
 
+class CompanyMasterMonitorTest(MonitorTestBase):
+    """Issue #41: 会社マスタの件数信号と、未適用の警報。"""
+
+    def put_master(self, applied, companies=11823, last_sub_rows=50000):
+        self.put("master/summary.json", _json_bytes({
+            "last_applied_snapshot_date": applied,
+            "companies": companies,
+            "last_submissions_rows": last_sub_rows}))
+
+    def test_current_master_is_ok_and_signals_present(self):
+        self.put_acquisition_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17")
+        self.put_master("2026-11-17")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["company_master"]["status"], "ok")
+        self.assertEqual(report["company_master"]["companies"], 11823)
+        self.assertEqual(report["signals"]["master_companies"], 11823)
+        self.assertEqual(
+            report["signals"]["master_last_submissions_rows"], 50000)
+        self.assertEqual(report["alerts"], [])
+
+    def test_stale_master_alerts(self):
+        self.put_acquisition_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17")
+        self.put_master("2026-11-16")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["company_master"]["status"], "stale")
+        kinds = [a["kind"] for a in report["alerts"]]
+        self.assertEqual(kinds, ["company_master_stale"])
+        alert = report["alerts"][0]
+        self.assertEqual(alert["last_applied_snapshot_date"], "2026-11-16")
+        self.assertEqual(alert["latest_snapshot_date"], "2026-11-17")
+        self.assertIn("company_master_stale",
+                      self.saved_state()["open_alerts"])
+
+    def test_missing_master_is_reported_without_alert(self):
+        self.put_acquisition_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["company_master"]["status"], "missing")
+        self.assertIsNone(report["signals"]["master_companies"])
+        self.assertIsNone(
+            report["signals"]["master_last_submissions_rows"])
+        self.assertEqual(report["alerts"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
