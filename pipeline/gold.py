@@ -30,6 +30,15 @@ gold/ への追加分 (本モジュールが正本):
 - snapshots/date=YYYY-MM-DD/: 日次スナップショットとしての版固定の
   複写 (仕様 §9、台帳 D14)。build / update のたびに当日の一式を置く。
 
+対象開始月 (--since-month) の扱い (Issue #55):
+- build は全量再生成のため、未指定なら第1期の既定値 2021-11 を使う。
+- update は差分更新のため、未指定なら既存の state.json が保持する
+  最古の月を引き継ぐ。state の範囲より狭い指定は、透かしと
+  source_months が黙って縮む事故を防ぐため、明示的にエラーで止める
+  (範囲を狭める意図がある場合は build で再生成する)。state の
+  書き直しでも、対象外の月の透かしは既存の state から引き継ぎ、
+  対象月の集合が縮むことはない。
+
 確定値と勝者決定:
 - Silver の事実は (会社, 要素, 期間, 次元区分, 単位) ごとに複数あり得る
   (有報のサマリの推移、訂正、前期分の再掲)。確定値は試作 (Step 1 の
@@ -1245,6 +1254,9 @@ def _prepare(paths, registry_path):
 def cmd_build(args):
     generated_at = _now()
     snapshot_date = generated_at[:10]
+    # build は全量再生成のため、未指定なら第1期の既定値を使う
+    if args.since_month is None:
+        args.since_month = DEFAULT_SINCE_MONTH
     paths = _resolve_paths(args)
     months = [m for m in silver_months(paths["silver_dir"])
               if m >= args.since_month]
@@ -1273,16 +1285,42 @@ def cmd_build(args):
             "uploaded": uploaded}
 
 
+def resolve_update_since_month(requested, old_months):
+    """update の対象開始月を決める (Issue #55)。
+
+    手動実行で未指定のまま第1期の既定値 2021-11 が使われ、全期間で
+    構築済みの state が狭い月の集合で書き直される事故を防ぐ規則:
+    - 未指定なら、既存の state が保持する最古の月を引き継ぐ。
+    - 指定が既存の state の最古の月より後 (範囲が狭い) 場合は、
+      状態が黙って縮むことを避けるため明示的にエラーで止める。
+      範囲を狭める意図がある場合は build で再生成すること。
+    - 既存の state が無い場合は、第1期の既定値を使う。
+    """
+    if not old_months:
+        return requested or DEFAULT_SINCE_MONTH
+    oldest = min(old_months)
+    if requested is None:
+        return oldest
+    if requested > oldest:
+        raise ValueError(
+            f"update の --since-month {requested} は既存の state の"
+            f"対象範囲 ({oldest} 以降) より狭く、状態が縮むため"
+            "実行を中止しました。範囲を狭める場合は build で"
+            "再生成してください (Issue #55)")
+    return requested
+
+
 def cmd_update(args):
     generated_at = _now()
     snapshot_date = generated_at[:10]
     paths = _resolve_paths(args)
-    months = [m for m in silver_months(paths["silver_dir"])
-              if m >= args.since_month]
     registry, code_to_id, listing_status, primary_security, doc_map, \
         lineage = _prepare(paths, args.registry or paths.get("registry"))
     existing, state = load_existing_gold(args.work_dir)
     old_months = (state or {}).get("months", {})
+    since_month = resolve_update_since_month(args.since_month, old_months)
+    months = [m for m in silver_months(paths["silver_dir"])
+              if m >= since_month]
     watermarks = {m: month_watermark(paths["silver_dir"], m)
                   for m in months}
     changed = [m for m in months
@@ -1338,10 +1376,12 @@ def cmd_update(args):
     tables["forecasts"] = existing.get("forecasts") \
         if existing.get("forecasts") is not None \
         else new_tables["forecasts"]
+    # 対象外の月 (Silver が手元に無い月) の透かしは既存の state から
+    # 引き継ぎ、対象月の集合が縮まないようにする (Issue #55)
     state = {"generated_at": generated_at,
              "registry_sha256": registry["_sha256"],
              "registry_version": registry.get("version"),
-             "months": watermarks}
+             "months": {**old_months, **watermarks}}
     # summary の件数は再生成した影響会社分ではなく、結合後の表全体で
     # 数え直す (部分集合の統計を全体の統計と誤表示しないため)
     summary = _make_summary(registry, stats, fact_stats, generated_at,
@@ -1429,7 +1469,7 @@ def _remote_months(since_month):
         if name.startswith("silver/month=") and name.endswith(
                 "silver.parquet"):
             month = name.split("/")[1][len("month="):]
-            if month >= since_month:
+            if since_month is None or month >= since_month:
                 months.add(month)
     return sorted(months)
 
@@ -1441,7 +1481,9 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument("--work-dir", required=True)
         p.add_argument("--upload", action="store_true")
-        p.add_argument("--since-month", default=DEFAULT_SINCE_MONTH)
+        # 未指定は None として受け、build は既定値、update は既存の
+        # state の範囲の引き継ぎ・縮小の拒否で解決する (Issue #55)
+        p.add_argument("--since-month", default=None)
         p.add_argument("--silver-dir")
         p.add_argument("--master-dir")
         p.add_argument("--catalog-dir")

@@ -539,5 +539,131 @@ class UpdateWatermarkTest(unittest.TestCase):
         self.assertEqual(result["note"], "no changes")
 
 
+class ResolveUpdateSinceMonthTest(unittest.TestCase):
+    """Issue #55: update の対象開始月の解決規則。"""
+
+    def test_unspecified_inherits_oldest_state_month(self):
+        old = {"2016-03": {}, "2026-06": {}}
+        self.assertEqual(gold.resolve_update_since_month(None, old),
+                         "2016-03")
+
+    def test_no_state_falls_back_to_default(self):
+        self.assertEqual(gold.resolve_update_since_month(None, {}),
+                         gold.DEFAULT_SINCE_MONTH)
+        self.assertEqual(gold.resolve_update_since_month("2016-03", {}),
+                         "2016-03")
+
+    def test_narrower_than_state_is_rejected(self):
+        with self.assertRaises(ValueError):
+            gold.resolve_update_since_month("2021-11", {"2016-03": {}})
+
+    def test_equal_or_wider_is_accepted(self):
+        old = {"2016-03": {}}
+        self.assertEqual(gold.resolve_update_since_month("2016-03", old),
+                         "2016-03")
+        self.assertEqual(gold.resolve_update_since_month("2015-01", old),
+                         "2015-01")
+
+
+class UpdateSinceGuardTest(unittest.TestCase):
+    """Issue #55: 手動実行相当の update で全期間の状態が縮まないこと。
+
+    Silver は 2021-11 の前後 (2020-05 と 2026-06) に置き、全期間
+    (since_month=2016-03) で build した state を対象にする。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.registry_path = os.path.join(self.tmp, "indicators.yaml")
+        with open(self.registry_path, "w", encoding="utf-8") as f:
+            f.write(REGISTRY_YAML)
+        self.silver_dir = os.path.join(self.tmp, "silver")
+        self.master_dir = os.path.join(self.tmp, "master")
+        self.catalog_dir = os.path.join(self.tmp, "catalog")
+        self.work_dir = os.path.join(self.tmp, "work")
+        os.makedirs(self.master_dir)
+        pq.write_table(
+            pa.table({"edinet_code": ["E00001"], "internal_id": [1]}),
+            os.path.join(self.master_dir, "edinet_codes.parquet"))
+        docs = {
+            "2020-05": ("D0", "2020-05-01 10:00",
+                        "2019-04-01", "2020-03-31"),
+            "2026-06": ("D1", "2026-06-01 10:00",
+                        "2025-04-01", "2026-03-31"),
+        }
+        for month, (doc_id, submit_at, start, end) in docs.items():
+            os.makedirs(os.path.join(self.silver_dir, f"month={month}"))
+            os.makedirs(os.path.join(self.catalog_dir, f"month={month}"))
+            with open(os.path.join(self.catalog_dir, f"month={month}",
+                                   "ledger.jsonl"),
+                      "w", encoding="utf-8") as f:
+                f.write(json.dumps(
+                    {"docID": doc_id, "edinetCode": "E00001",
+                     "docTypeCode": "120", "submitDateTime": submit_at,
+                     "periodStart": start, "periodEnd": end},
+                    ensure_ascii=False) + "\n")
+            self._write_silver(month, doc_id, 1000.0, submit_at,
+                               start, end)
+
+    def _write_silver(self, month, doc_id, value, submit_at, start, end):
+        table = pa.table({
+            "doc_id": [doc_id],
+            "element": ["jpcrp_cor:NetSalesSummaryOfBusinessResults"],
+            "value": [float(value)],
+            "unit": ["iso4217:JPY"],
+            "context_start": [start],
+            "context_end": [end],
+            "dimension": [""],
+            "submit_at": [submit_at],
+            "point_in_time": ["as_filed"],
+        })
+        pq.write_table(
+            table, os.path.join(self.silver_dir, f"month={month}",
+                                "silver.parquet"))
+
+    def _args(self, command, since_month):
+        return SimpleNamespace(
+            command=command, work_dir=self.work_dir, upload=False,
+            since_month=since_month, silver_dir=self.silver_dir,
+            master_dir=self.master_dir, catalog_dir=self.catalog_dir,
+            index=None, registry=self.registry_path)
+
+    def _state_months(self):
+        with open(os.path.join(self.work_dir, "gold", "state.json"),
+                  encoding="utf-8") as f:
+            return set(json.load(f)["months"])
+
+    def _build_full(self):
+        gold.cmd_build(self._args("build", "2016-03"))
+        self.assertEqual(self._state_months(), {"2020-05", "2026-06"})
+
+    def test_unspecified_update_does_not_shrink_state(self):
+        # 全期間で build した後、新しい月だけを書き換えて、手動
+        # dispatch 相当の since_month 未指定で update する。変更は
+        # 取り込まれ、state と summary の対象月は全期間のまま縮まない
+        self._build_full()
+        self._write_silver("2026-06", "D1", 2000.0, "2026-06-01 10:00",
+                           "2025-04-01", "2026-03-31")
+        result = gold.cmd_update(self._args("update", None))
+        self.assertEqual(result["changed_months"], ["2026-06"])
+        self.assertEqual(self._state_months(), {"2020-05", "2026-06"})
+        self.assertEqual(result["summary"]["source_months"],
+                         ["2020-05", "2026-06"])
+        annual = pq.read_table(
+            os.path.join(self.work_dir, "gold", "annual.parquet"))
+        rows = {r["period_end"]: r for r in annual.to_pylist()}
+        self.assertEqual(rows["2026-03-31"]["net_sales"], 2000.0)
+        self.assertEqual(rows["2020-03-31"]["net_sales"], 1000.0)
+
+    def test_narrower_update_is_rejected_and_state_untouched(self):
+        # state の範囲より狭い指定 (既定値だった 2021-11) は明示的に
+        # エラーで止まり、state は書き換わらない
+        self._build_full()
+        with self.assertRaises(ValueError):
+            gold.cmd_update(self._args("update", "2021-11"))
+        self.assertEqual(self._state_months(), {"2020-05", "2026-06"})
+
+
 if __name__ == "__main__":
     unittest.main()

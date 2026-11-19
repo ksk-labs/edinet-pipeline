@@ -11,7 +11,9 @@ name: gold
 #   ローカルでは実行できないため、Actions 経由が唯一の経路である。
 #   登録簿の内容は dispatch 時の registry_yaml 入力で渡す。
 # - since_month: build / update の対象開始月 (YYYY-MM)。空なら
-#   pipeline.gold の既定値 2021-11 (第1期) を使う。全期間の再生成は
+#   build は pipeline.gold の既定値 2021-11 (第1期) を使い、update は
+#   既存の state.json が保持する最古の月を引き継ぐ (state の範囲より
+#   狭い指定は gold.py 側でエラーになる。Issue #55)。全期間の再生成は
 #   2016-03 を指定する (第2期 Silver を含む全129か月が対象になる)。
 # 日次の定期実行 (Issue #50): 主経路は daily_parse の後段ジョブ
 # (gold-update) で、Silver へ反映された差分へ同じ run の中で追随
@@ -43,7 +45,7 @@ on:
         required: false
         type: string
       since_month:
-        description: "build / update の対象開始月 YYYY-MM（空なら既定値 2021-11）"
+        description: "build / update の対象開始月 YYYY-MM（空なら build は既定値 2021-11、update は state の範囲を引き継ぐ）"
         required: false
         default: ''
         type: string
