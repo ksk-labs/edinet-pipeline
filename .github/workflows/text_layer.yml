@@ -1,0 +1,100 @@
+name: text_layer
+
+# テキスト層の器 (P2-T7、pipeline.text_layer) の運用ワークフロー。
+# 提出 zip (v2 データセットの raw/) を arelle で読み、文字事実を
+# 取り出して text/ 配下へ格納する。1回の実行は1書類分であり、
+# 器の実地確認と個別の取り込みのための手動経路である。全書類への
+# 一括・日次の取り込みはテキスト層の本格実装 (別工程) で配線する。
+# - extract: 提出 zip から文字事実レコード (JSONL) を作る
+# - build: レコードと会社マスタ (master/edinet_codes.parquet) から
+#   items / representative_observations / summary を作り配置する
+# 必要な秘密は HF_TOKEN のみ (v2 データセットの読み取りは公開の
+# ため不要)。
+# arelle の版は 2.47.5 に固定する (parse.py と同じ。版更新時は
+# 標本照合が必須)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      doc_id:
+        description: "書類 ID (例: S100ZI7X)"
+        required: true
+        type: string
+      edinet_code:
+        description: "提出者の EDINET コード (例: E03481)"
+        required: true
+        type: string
+      submit_at:
+        description: "提出日時 (例: 2026-11-17 10:59)"
+        required: true
+        type: string
+      submit_date:
+        description: "提出日 (raw/ の日付パス用、YYYY-MM-DD)"
+        required: true
+        type: string
+
+jobs:
+  text-layer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install arelle-release==2.47.5
+      - name: Download filing zip and company master
+        env:
+          DOC_ID: ${{ inputs.doc_id }}
+          SUBMIT_DATE: ${{ inputs.submit_date }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/text/master
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          repo = "Yoshi-Dai/financial-lakehouse-v2"
+          doc = os.environ["DOC_ID"]
+          y, m, d = os.environ["SUBMIT_DATE"].split("-")
+          got = hf_hub_download(
+              repo_id=repo, repo_type="dataset",
+              filename=f"raw/edinet/{y}/{m}/{d}/zip/{doc}.zip")
+          os.rename(got, "work/text/filing.zip")
+          got = hf_hub_download(
+              repo_id=repo, repo_type="dataset",
+              filename="master/edinet_codes.parquet")
+          os.rename(got, "work/text/master/edinet_codes.parquet")
+          PY
+      - name: Extract text facts and build text layer
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DOC_ID: ${{ inputs.doc_id }}
+          EDINET_CODE: ${{ inputs.edinet_code }}
+          SUBMIT_AT: ${{ inputs.submit_at }}
+        run: |
+          set -euo pipefail
+          python -m pipeline.text_layer extract \
+            --zip work/text/filing.zip \
+            --doc-id "$DOC_ID" \
+            --edinet-code "$EDINET_CODE" \
+            --submit-at "$SUBMIT_AT" \
+            --out work/text/facts.jsonl \
+            --webcache-dir work/text/webcache
+          python -m pipeline.text_layer build \
+            --work-dir work/text \
+            --facts work/text/facts.jsonl \
+            --master-dir work/text/master \
+            --upload \
+            | tee work/text/result.json
+      - name: Upload build summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: text-layer-summary
+          path: |
+            work/text/result.json
+            work/text/text_out/summary.json
+          if-no-files-found: warn
