@@ -36,6 +36,10 @@ docs/records/2026-11-19-issue25-dict-backfill-work-record.md):
 - 進捗は dictionary/backfill/month=<月>/ledger.jsonl (書類単位の台帳)。
   ok / quarantined は完了として再実行で飛ばし、failed は再試行する。
   tar は日単位で取得して処理後に消すため、中断しても日単位で再開できる。
+- 書類ごとの書き込みは、ラベル行 (shard) を先に書いてから台帳へ記録
+  する順序にする。台帳が先行すると、中断時に台帳だけが進んでラベルが
+  欠けたまま再開で飛ばされる。ラベルだけが書かれた状態は、再抽出と
+  統合時の重複除去で通常実行と同じ結果に収束する。
 
 対象要素の結果の分類 (台帳の各エントリに理由つきで残る):
 - resolved_text: 表示名 (日英どちらか) が取れた。
@@ -499,11 +503,21 @@ def run_month(api, month, *, index, standard_keys, work_dir, upload=False,
                              "targets": len(targets[doc_id])}
                     label_rows = []
                     cntlr = None  # 次の書類で Cntlr を作り直す
-                _append(ledger, entry)
+                # ラベル行は台帳への記録より先に shard へ書く (台帳の
+                # 追記と同じく fsync まで行う)。台帳が先だと、その間で
+                # 落ちたときに「台帳は解決済み・ラベルは欠落」のまま
+                # 再開で飛ばされ、要約の解決数とラベルファイルが黙って
+                # 食い違う (SF-1)。ラベルだけが残った場合は再抽出で
+                # 重複行が出るが、統合 (merge_label_rows) の重複除去が
+                # 受けるため冪等に収束する。
                 if label_rows:
                     with open(shard_path, "a", encoding="utf-8") as f:
                         for row in label_rows:
-                            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                            f.write(json.dumps(row, ensure_ascii=False)
+                                    + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                _append(ledger, entry)
         finally:
             if tf is not None:
                 tf.close()

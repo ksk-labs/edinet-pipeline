@@ -9,6 +9,9 @@
 - ラベルの統合は既存行優先 (parse.run_merge と同じ規則) で冪等。
   同じ作業ディレクトリで再実行しても追加行は増えない。
 - 隔離 (Quarantine) の書類は完了として台帳に残り、再実行で飛ばす。
+- 書類ごとの書き込みはラベル (shard) が先で台帳が後 (SF-1)。shard の
+  書き込みに失敗した書類は台帳に完了と記録されず再実行で処理し直され、
+  ラベルだけが残った状態も再実行で通常実行と同じ結果に収束する。
 """
 import io
 import json
@@ -248,6 +251,57 @@ class RunMonthTest(unittest.TestCase):
         self.assertEqual(second["done_docs"], first["done_docs"])
         with open(labels_out, "rb") as f:
             self.assertEqual(f.read(), before)
+
+    def test_shard_write_failure_keeps_doc_out_of_ledger(self):
+        # SF-1 の回帰: shard のパスをディレクトリにして初回の書き込みを
+        # 失敗させる。ラベルが書けなかった書類は台帳に完了 (ok) と
+        # 記録されず、障害を取り除いた再実行で処理し直されて通常実行と
+        # 同じ結果になる。台帳が先行する実装では、初回で ok が記録され、
+        # 再実行で書類が飛ばされてラベルが欠けたままになる。
+        shard = os.path.join(self.work, "labels", f"month={MONTH}.jsonl")
+        os.makedirs(shard)
+        with self.assertRaises(IsADirectoryError):
+            self._run()
+        ledger_path = os.path.join(self.work, "ledger",
+                                   f"month={MONTH}.jsonl")
+        entries = []
+        if os.path.exists(ledger_path):
+            with open(ledger_path, encoding="utf-8") as f:
+                entries = [json.loads(line) for line in f if line.strip()]
+        self.assertEqual(
+            [e for e in entries if e.get("status") == "ok"], [])
+        os.rmdir(shard)
+        summary = self._run()
+        self.assertEqual(summary["done_docs"], 3)
+        self.assertEqual(summary["resolved_text"], 1)
+        self.assertEqual(summary["label_rows_total"], 2)
+        self.assertEqual(summary["label_rows_added"], 2)
+
+    def test_labels_without_ledger_entry_converge_on_rerun(self):
+        # 逆向きの不整合: 前回実行がラベル行を書いた直後に落ち、台帳に
+        # 記録が無い状態を作る。再実行では再抽出で shard に重複行が
+        # 増えるが、統合時の重複除去で通常実行と同じ出力に収束する。
+        shard_dir = os.path.join(self.work, "labels")
+        os.makedirs(shard_dir)
+        rows = [dict(_label("E00001-000:Foo", ja="フー"), doc_id="D1"),
+                dict(_label("E00001-000:Bar", ja=None, en=None),
+                     doc_id="D1")]
+        with open(os.path.join(shard_dir, f"month={MONTH}.jsonl"),
+                  "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        summary = self._run()
+        self.assertEqual(summary["resolved_text"], 1)
+        self.assertEqual(summary["label_rows_total"], 2)
+        self.assertEqual(summary["label_rows_added"], 2)
+        labels_out = os.path.join(
+            self.work, "out", "parse", f"month={MONTH}",
+            "extension_labels.jsonl")
+        with open(labels_out, encoding="utf-8") as f:
+            out_rows = [json.loads(line) for line in f if line.strip()]
+        self.assertEqual(len(out_rows), 2)
+        self.assertEqual({r["element"] for r in out_rows},
+                         {"E00001-000:Foo", "E00001-000:Bar"})
 
 
 if __name__ == "__main__":
