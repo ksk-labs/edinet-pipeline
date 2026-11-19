@@ -6,8 +6,10 @@
 取得元 (一次情報で確定。STATE.md「タクソノミ取得元の確定」):
 - 金融庁「EDINETタクソノミ一覧」ページ (版と ZIP の所在の正本):
   https://www.fsa.go.jp/search/EDINET_Taxonomy_All.html
-  各版の ZIP は /search/<公表日YYYYMMDD>/1c_Taxonomy.zip の形で置かれる
-  (ARIA-3 の taxonomy_urls.json と実ダウンロードで確認済み)。
+  一覧ページには版ごとの日付別詳細ページ (/search/<公表日YYYYMMDD>.html)
+  へのリンクがあり、ZIP へのリンク (/search/<公表日YYYYMMDD>/1c_Taxonomy.zip)
+  は詳細ページ側にある (2026-11-19 に実ページで確認。一覧ページ自体に
+  ZIP へのリンクは無い)。
 - 配布ポータル「EDINET TAXONOMY & CODE LIST DOWNLOAD」:
   https://disclosure2.edinet-fsa.go.jp/weee0020.aspx
   分類 (00 ALL、01 DEI、02 財務諸表本表 等) ごとに ALL_<タクソノミ日付>.zip
@@ -106,6 +108,7 @@ _XML_NS = "http://www.w3.org/XML/1998/namespace"
 _PARSER = etree.XMLParser(no_network=True, huge_tree=True, recover=False)
 
 _ZIP_URL_RE = re.compile(r"/search/(\d{8})/(1c_Taxonomy\.zip)")
+_DETAIL_PAGE_RE = re.compile(r'href="([^"]*/search/(\d{8})\.html)"')
 _EDITION_LABEL_RE = re.compile(r"(20\d\d)\s*年版")
 _PORTAL_FILE_RE = re.compile(r"onDownload\('([^']+\.zip)'\)")
 _ALL_FILE_RE = re.compile(r"^ALL_(\d{8})\.zip$")
@@ -178,22 +181,25 @@ def edition_year_for(published):
 
 
 def parse_list_page(html_text):
-    """金融庁の一覧ページから版の一覧を抽出する。
+    """金融庁の一覧ページから版の一覧 (詳細ページへのリンク) を抽出する。
 
-    戻り値: [{edition, published, zip_url}] (公表日の降順)。
-    ZIP の URL パターン (/search/<公表日>/1c_Taxonomy.zip) を正とし、
-    版年はリンク周辺の「YYYY年版」表記を優先し、無ければ
+    実ページの構造は、版ごとの日付別詳細ページ
+    (/search/<公表日YYYYMMDD>.html) へのリンクであり、ZIP へのリンクは
+    一覧ページには無く詳細ページ側にある。
+    戻り値: [{edition, published, detail_url}] (公表日の降順)。
+    版年はリンク文字列の「YYYY年版」表記を優先し、無ければ
     edition_year_for で導く。同じ公表日の重複は1件にまとめる。
     """
-    editions = {}
-    matches = list(_ZIP_URL_RE.finditer(html_text))
+    entries = {}
+    matches = list(_DETAIL_PAGE_RE.finditer(html_text))
     for i, m in enumerate(matches):
-        digits = m.group(1)
+        digits = m.group(2)
         published = f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
-        url = ("https://www.fsa.go.jp/search/"
-               f"{digits}/{m.group(2)}")
+        href = m.group(1)
+        detail_url = (href if href.startswith("http")
+                      else "https://www.fsa.go.jp" + href)
         # 版年表記はリンク文字列 (URL の直後) にあるのが実ページの形。
-        # 次の ZIP リンクまでの範囲で最初の表記を取り、無ければ直前の
+        # 次の詳細リンクまでの範囲で最初の表記を取り、無ければ直前の
         # 範囲の最後の表記を取る (隣の版の表記を拾わないため)。
         label = None
         next_start = (matches[i + 1].start() if i + 1 < len(matches)
@@ -208,12 +214,53 @@ def parse_list_page(html_text):
             if labels:
                 label = int(labels[-1])
         edition = label if label is not None else edition_year_for(published)
-        editions[published] = {
-            "edition": edition, "published": published, "zip_url": url,
+        entries[published] = {
+            "edition": edition, "published": published,
+            "detail_url": detail_url,
             "edition_label_found": label is not None,
         }
-    return sorted(editions.values(), key=lambda e: e["published"],
+    return sorted(entries.values(), key=lambda e: e["published"],
                   reverse=True)
+
+
+def parse_detail_page(html_text):
+    """版の詳細ページから ZIP の URL を抽出する (無ければ None)。"""
+    m = _ZIP_URL_RE.search(html_text)
+    if not m:
+        return None
+    return f"https://www.fsa.go.jp/search/{m.group(1)}/{m.group(2)}"
+
+
+def fetch_editions(fetcher, html_text):
+    """一覧ページの各版について詳細ページを辿り ZIP の URL を解決する。
+
+    戻り値: [{edition, published, zip_url}] (公表日の降順)。
+    最新の版が解決できない場合は TaxonomyError にする (新版検出の入口が
+    壊れているため)。古い版は、詳細ページに ZIP リンクが無いもの
+    (初期の版は配布形式が違う) や取得に失敗したものを結果から除く。
+    """
+    editions = []
+    for i, entry in enumerate(parse_list_page(html_text)):
+        try:
+            html = fetcher(entry["detail_url"]).decode(
+                "utf-8", errors="replace")
+            zip_url = parse_detail_page(html)
+        except Exception:
+            if i == 0:
+                raise
+            continue
+        if zip_url is None:
+            if i == 0:
+                raise TaxonomyError(
+                    "最新の版の詳細ページから ZIP を抽出できませんでした: "
+                    + entry["detail_url"])
+            continue
+        editions.append({
+            "edition": entry["edition"], "published": entry["published"],
+            "zip_url": zip_url,
+            "edition_label_found": entry["edition_label_found"],
+        })
+    return editions
 
 
 def parse_portal_page(html_text):
@@ -870,7 +917,7 @@ def run_check(work_dir, repo=DEFAULT_REPO, fetcher=None, save_state=True):
 
     try:
         html = fetcher(LIST_PAGE_URL).decode("utf-8", errors="replace")
-        editions = parse_list_page(html)
+        editions = fetch_editions(fetcher, html)
         if not editions:
             raise TaxonomyError("一覧ページから版を抽出できませんでした")
         latest = editions[0]

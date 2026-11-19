@@ -5,6 +5,7 @@
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -22,10 +23,14 @@ from pipeline.taxonomy import (
 
 LIST_PAGE_HTML = """
 <html><body>
-<a href="https://www.fsa.go.jp/search/20241112/1c_Taxonomy.zip">
-2025年版EDINETタクソノミ [2024年11月12日]</a>
-<a href="https://www.fsa.go.jp/search/20251111/1c_Taxonomy.zip">
-2026年版EDINETタクソノミ [2025年11月11日]</a>
+<a href="/search/20241112.html">2025年版EDINETタクソノミ</a> [2024年(令和６年)11月12日]
+<a href="/search/20251111.html">2026年版EDINETタクソノミ</a> [2025年(令和７年)11月11日]
+</body></html>
+"""
+
+DETAIL_PAGE_HTML = """
+<html><body>
+<a href="/search/{digits}/1c_Taxonomy.zip">EDINETタクソノミ</a>
 </body></html>
 """
 
@@ -114,12 +119,46 @@ def make_taxonomy_zip(date="2024-11-01", extra_elements=(), drop=()):
 
 class ListPageTest(unittest.TestCase):
     def test_parse_list_page(self):
-        editions = parse_list_page(LIST_PAGE_HTML)
+        entries = parse_list_page(LIST_PAGE_HTML)
+        self.assertEqual([e["edition"] for e in entries], [2026, 2025])
+        self.assertEqual(entries[0]["published"], "2025-11-11")
+        self.assertEqual(
+            entries[0]["detail_url"],
+            "https://www.fsa.go.jp/search/20251111.html")
+
+    def test_parse_detail_page(self):
+        html = DETAIL_PAGE_HTML.format(digits="20251111")
+        self.assertEqual(
+            taxonomy.parse_detail_page(html),
+            "https://www.fsa.go.jp/search/20251111/1c_Taxonomy.zip")
+        self.assertIsNone(taxonomy.parse_detail_page("<html></html>"))
+
+    def test_fetch_editions_follows_detail_pages(self):
+        # MF-1 の回帰: 実ページの構造 (一覧→日付別詳細ページ→ZIP) で
+        # 版が解決できること。一覧ページ自体に ZIP リンクは無い。
+        self.assertNotIn("1c_Taxonomy.zip", LIST_PAGE_HTML)
+        editions = taxonomy.fetch_editions(make_fetcher(), LIST_PAGE_HTML)
         self.assertEqual([e["edition"] for e in editions], [2026, 2025])
         self.assertEqual(editions[0]["published"], "2025-11-11")
         self.assertEqual(
             editions[0]["zip_url"],
             "https://www.fsa.go.jp/search/20251111/1c_Taxonomy.zip")
+
+    def test_fetch_editions_latest_without_zip_fails(self):
+        def fetch(url):
+            return b"<html>no zip link</html>"
+        with self.assertRaises(TaxonomyError):
+            taxonomy.fetch_editions(fetch, LIST_PAGE_HTML)
+
+    def test_fetch_editions_drops_unresolvable_old_entry(self):
+        # 初期の版は詳細ページの配布形式が違い ZIP リンクが無い。
+        # 最新の版が解決できれば、古い版は結果から除いてよい。
+        def fetch(url):
+            if url.endswith("20251111.html"):
+                return DETAIL_PAGE_HTML.format(digits="20251111").encode()
+            return b"<html>old format</html>"
+        editions = taxonomy.fetch_editions(fetch, LIST_PAGE_HTML)
+        self.assertEqual([e["edition"] for e in editions], [2026])
 
     def test_edition_year_rule(self):
         self.assertEqual(edition_year_for("2025-11-11"), 2026)
@@ -348,6 +387,10 @@ def make_fetcher(portal_html=PORTAL_HTML, zip_bytes=None, fail_zip=False):
     def fetch(url):
         if url == taxonomy.LIST_PAGE_URL:
             return LIST_PAGE_HTML.encode()
+        detail = re.search(r"/search/(\d{8})\.html$", url)
+        if detail:
+            return DETAIL_PAGE_HTML.format(
+                digits=detail.group(1)).encode()
         if url == taxonomy.PORTAL_URL:
             return portal_html.encode()
         if url == taxonomy.COUNCIL_PAGE_URL:
