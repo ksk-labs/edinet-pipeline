@@ -242,7 +242,7 @@ def build_items(facts, code_to_id, generated_at):
             category = classify_element(fact.get("element"))
         certainty = fact.get("certainty")
         if certainty not in CERTAINTIES:
-            certainty = CERTAINTY_CONFIRMED
+            certainty = CERTAINTY_UNCONFIRMED
         code = fact.get("edinet_code")
         internal_id = code_to_id.get(code) if code else None
         if code and internal_id is None:

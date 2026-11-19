@@ -133,6 +133,24 @@ class BuildItemsTest(unittest.TestCase):
         self.assertEqual(items[0]["certainty"], "unconfirmed")
         self.assertEqual(items[0]["normalized_summary"], "要約")
 
+    def test_missing_certainty_defaults_to_unconfirmed(self):
+        f = fact("jpcrp_cor:CompanyHistoryTextBlock", "沿革の本文")
+        del f["certainty"]
+        items, _ = build_items([f], CODE_TO_ID, GENERATED_AT)
+        self.assertEqual(items[0]["certainty"], "unconfirmed")
+
+    def test_invalid_certainty_defaults_to_unconfirmed(self):
+        f = fact("jpcrp_cor:CompanyHistoryTextBlock", "沿革の本文",
+                 certainty="unknown")
+        items, _ = build_items([f], CODE_TO_ID, GENERATED_AT)
+        self.assertEqual(items[0]["certainty"], "unconfirmed")
+
+    def test_explicit_confirmed_kept(self):
+        f = fact("jpcrp_cor:CompanyHistoryTextBlock", "沿革の本文",
+                 certainty="confirmed")
+        items, _ = build_items([f], CODE_TO_ID, GENERATED_AT)
+        self.assertEqual(items[0]["certainty"], "confirmed")
+
     def test_explicit_category_wins_over_element_map(self):
         f = fact("jpcrp_cor:SomeOtherTextBlock", "優待の記述",
                  category="shareholder_benefits")

@@ -5,6 +5,11 @@ name: text_layer
 # 取り出して text/ 配下へ格納する。1回の実行は1書類分であり、
 # 器の実地確認と個別の取り込みのための手動経路である。全書類への
 # 一括・日次の取り込みはテキスト層の本格実装 (別工程) で配線する。
+# 注意: build は入力全部からの全置き換えであり、このワークフローは
+# 指定した1書類分だけで build して配置する。したがって dispatch の
+# たびに text/ は当該書類のみの内容で置き換わり、別の書類で再度
+# dispatch すると先に取り込んだ書類の items は text/ から消える
+# (蓄積する経路ではない)。
 # - extract: 提出 zip から文字事実レコード (JSONL) を作る
 # - build: レコードと会社マスタ (master/edinet_codes.parquet) から
 #   items / representative_observations / summary を作り配置する
