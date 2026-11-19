@@ -59,6 +59,8 @@ EDINET 有報タクソノミ (jpcrp_cor) の要素からカテゴリへの対応
 明示する。
 
 使い方:
+  python -m pipeline.text_layer download --doc-id ID \
+      --submit-date YYYY-MM-DD --zip-out ZIP --master-dir DIR
   python -m pipeline.text_layer extract --zip ZIP --doc-id ID \
       --edinet-code CODE --submit-at TS --out facts.jsonl
   python -m pipeline.text_layer build --work-dir DIR [--upload]
@@ -468,6 +470,22 @@ def download_master(repo, work_dir):
     return master_dir
 
 
+def run_download(repo, doc_id, submit_date, zip_out, master_dir):
+    """提出 zip と会社マスタを取得し、実体ファイルとして配置する。"""
+    year, month, day = submit_date.split("-")
+    zip_dir = os.path.dirname(zip_out)
+    if zip_dir:
+        os.makedirs(zip_dir, exist_ok=True)
+    os.makedirs(master_dir, exist_ok=True)
+    _download_one(repo,
+                  f"raw/edinet/{year}/{month}/{day}/zip/{doc_id}.zip",
+                  zip_out)
+    master_path = os.path.join(master_dir, "edinet_codes.parquet")
+    _download_one(repo, f"{MASTER_PREFIX}/edinet_codes.parquet",
+                  master_path)
+    return {"zip": zip_out, "master": master_path}
+
+
 def write_outputs(items, observations, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(items, schema=ITEMS_SCHEMA),
@@ -554,6 +572,15 @@ def main(argv=None):
                                          "text-layer-webcache"),
                     help="arelle のタクソノミキャッシュの置き場所")
 
+    dl = sub.add_parser("download", help="提出 zip と会社マスタを取得する")
+    dl.add_argument("--repo", default=DEFAULT_REPO)
+    dl.add_argument("--doc-id", required=True, help="源泉側の書類 ID")
+    dl.add_argument("--submit-date", required=True,
+                    help="提出日 (raw/ の日付パス用、YYYY-MM-DD)")
+    dl.add_argument("--zip-out", required=True, help="提出 zip の配置先")
+    dl.add_argument("--master-dir", required=True,
+                    help="edinet_codes.parquet の配置先ディレクトリ")
+
     bu = sub.add_parser("build", help="文字事実から成果物を構築する")
     bu.add_argument("--work-dir", required=True, help="作業ディレクトリ")
     bu.add_argument("--repo", default=DEFAULT_REPO)
@@ -568,6 +595,10 @@ def main(argv=None):
     if args.command == "extract":
         result = run_extract(args.zip, args.doc_id, args.edinet_code,
                              args.submit_at, args.out, args.webcache_dir)
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+    elif args.command == "download":
+        result = run_download(args.repo, args.doc_id, args.submit_date,
+                              args.zip_out, args.master_dir)
         json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
     else:
         result = run_build(args.work_dir, repo=args.repo,

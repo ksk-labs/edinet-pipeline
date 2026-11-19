@@ -10,6 +10,9 @@ name: text_layer
 # たびに text/ は当該書類のみの内容で置き換わり、別の書類で再度
 # dispatch すると先に取り込んだ書類の items は text/ から消える
 # (蓄積する経路ではない)。
+# - download: 提出 zip と会社マスタを HF から取得して配置する
+#   (pipeline.text_layer download。配置はモジュール側で行い、
+#   ワークフローにダウンロードの手順を持たせない)
 # - extract: 提出 zip から文字事実レコード (JSONL) を作る
 # - build: レコードと会社マスタ (master/edinet_codes.parquet) から
 #   items / representative_observations / summary を作り配置する
@@ -57,22 +60,11 @@ jobs:
           SUBMIT_DATE: ${{ inputs.submit_date }}
         run: |
           set -euo pipefail
-          mkdir -p work/text/master
-          python - <<'PY'
-          import os
-          from huggingface_hub import hf_hub_download
-          repo = "Yoshi-Dai/financial-lakehouse-v2"
-          doc = os.environ["DOC_ID"]
-          y, m, d = os.environ["SUBMIT_DATE"].split("-")
-          got = hf_hub_download(
-              repo_id=repo, repo_type="dataset",
-              filename=f"raw/edinet/{y}/{m}/{d}/zip/{doc}.zip")
-          os.rename(got, "work/text/filing.zip")
-          got = hf_hub_download(
-              repo_id=repo, repo_type="dataset",
-              filename="master/edinet_codes.parquet")
-          os.rename(got, "work/text/master/edinet_codes.parquet")
-          PY
+          python -m pipeline.text_layer download \
+            --doc-id "$DOC_ID" \
+            --submit-date "$SUBMIT_DATE" \
+            --zip-out work/text/filing.zip \
+            --master-dir work/text/master
       - name: Extract text facts and build text layer
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
