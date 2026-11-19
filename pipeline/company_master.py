@@ -88,6 +88,7 @@ update は --catalog-dir (書類目録 JSONL のローカルディレクトリ) 
 """
 import argparse
 import collections
+import copy
 import csv
 import hashlib
 import io
@@ -1397,7 +1398,10 @@ def run_update(work_dir, repo=DEFAULT_REPO, state_dir=None,
 
     スナップショットの適用に加え、書類目録 (catalog/) の集計で
     last_submissions を更新する。目録は取得経路が既に v2 へ保存した
-    ものを読むだけであり、EDINET への再取得はしない。
+    ものを読むだけであり、EDINET への再取得はしない。目録側
+    (読み取り・集計・反映) の失敗は分離し、summary の
+    last_submissions_refresh に error_kind と error として記録する。
+    スナップショットの適用と保存は目録側の失敗では止めない。
     """
     generated_at = _now()
     state = read_state(state_dir) if state_dir else download_master(
@@ -1407,10 +1411,19 @@ def run_update(work_dir, repo=DEFAULT_REPO, state_dir=None,
         snapshots = (load_local_snapshots(snapshots_dir) if snapshots_dir
                      else download_snapshots(repo, work_dir))
     applied = apply_new_snapshots(state, snapshots, generated_at)
-    if catalog_rows is None:
-        catalog_rows = download_catalog_rows(repo, work_dir)
-    last_sub_stats = refresh_last_submissions(
-        state, aggregate_catalog_submissions(catalog_rows), generated_at)
+    last_submissions_before = copy.deepcopy(state["last_submissions"])
+    try:
+        if catalog_rows is None:
+            catalog_rows = download_catalog_rows(repo, work_dir)
+        last_sub_stats = refresh_last_submissions(
+            state, aggregate_catalog_submissions(catalog_rows),
+            generated_at)
+    except Exception as e:
+        state["last_submissions"] = last_submissions_before
+        last_sub_stats = {
+            "updated_rows": 0, "new_rows": 0, "added_documents": 0,
+            "unknown_codes": 0, "unknown_documents": 0,
+            "error_kind": type(e).__name__, "error": f"{e}"[:500]}
     out_dir = os.path.join(work_dir, "master_out")
     write_state(state, out_dir)
     summary = build_summary(

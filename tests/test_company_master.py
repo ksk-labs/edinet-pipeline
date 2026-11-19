@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -552,6 +553,19 @@ class AggregateCatalogSubmissionsTest(unittest.TestCase):
         agg = aggregate_catalog_submissions(rows)
         self.assertEqual(sum(agg[("E00001", "120")]["by_date"].values()), 1)
 
+    def test_duplicate_with_different_dates_keeps_newest(self):
+        rows = [
+            catalog_row("S1", "E00001", "120", "2026-11-19 09:00:00"),
+            catalog_row("S1", "E00001", "120", "2026-11-17 09:00:00"),
+            catalog_row("S2", "E00001", "120", "2026-11-17 09:00:00"),
+            catalog_row("S2", "E00001", "120", "2026-11-18 09:00:00"),
+        ]
+        agg = aggregate_catalog_submissions(rows)
+        a = agg[("E00001", "120")]
+        self.assertEqual(a["last"], "2026-11-19")
+        self.assertEqual(dict(a["by_date"]),
+                         {"2026-11-19": 1, "2026-11-18": 1})
+
 
 class RefreshLastSubmissionsTest(unittest.TestCase):
     def state_with_seed(self):
@@ -662,6 +676,59 @@ class RunUpdateCatalogTest(unittest.TestCase):
             self.assertEqual(rows[("E00001", "120")]["last_submit_date"],
                              "2026-11-19")
             self.assertEqual(rows[("E00003", "120")]["document_count"], 1)
+
+    def seed_state_dir(self, tmp):
+        history_dir = os.path.join(tmp, "history")
+        build_history_dir(history_dir)
+        state = state_from_history(history_dir, GEN)
+        apply_new_snapshots(state, [(SNAP1_DATE, SNAP1)], GEN)
+        iid = [r for r in state["edinet_codes"]
+               if r["edinet_code"] == "E00001"][0]["internal_id"]
+        state["last_submissions"].append(
+            last_sub_row("E00001", "120", "2026-11-10", 5, iid=iid))
+        state_dir = os.path.join(tmp, "state_in")
+        write_state(state, state_dir)
+        return state_dir
+
+    def assert_snapshot_applied_despite_refresh_error(self, tmp, result):
+        from pipeline.company_master import read_state
+        summary = result["summary"]
+        self.assertEqual(summary["last_applied_snapshot_date"], SNAP2_DATE)
+        self.assertIn("error_kind",
+                      summary["last_submissions_refresh"])
+        self.assertEqual(summary["last_submissions_rows"], 1)
+        out = read_state(os.path.join(tmp, "work", "master_out"))
+        row = out["last_submissions"][0]
+        self.assertEqual(row["document_count"], 5)
+        self.assertEqual(row["last_submit_date"], "2026-11-10")
+
+    def test_update_survives_catalog_download_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = self.seed_state_dir(tmp)
+            with mock.patch(
+                    "pipeline.company_master.download_catalog_rows",
+                    side_effect=RuntimeError("catalog read failed")):
+                result = run_update(os.path.join(tmp, "work"),
+                                    state_dir=state_dir,
+                                    snapshots=[(SNAP2_DATE, SNAP2)])
+            self.assert_snapshot_applied_despite_refresh_error(tmp, result)
+            self.assertEqual(
+                result["summary"]["last_submissions_refresh"]["error_kind"],
+                "RuntimeError")
+
+    def test_update_survives_corrupt_catalog_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = self.seed_state_dir(tmp)
+            catalog = [{"docID": "S1", "edinetCode": "E00001",
+                        "docTypeCode": "120", "submitDateTime": 20261119}]
+            result = run_update(os.path.join(tmp, "work"),
+                                state_dir=state_dir,
+                                snapshots=[(SNAP2_DATE, SNAP2)],
+                                catalog_rows=catalog)
+            self.assert_snapshot_applied_despite_refresh_error(tmp, result)
+            self.assertEqual(
+                result["summary"]["last_submissions_refresh"]["error_kind"],
+                "TypeError")
 
 
 if __name__ == "__main__":

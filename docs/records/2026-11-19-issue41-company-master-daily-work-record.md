@@ -101,6 +101,47 @@ concurrency グループはリポジトリ全体で有効である（GitHub 公�
 - ワークフロー YAML 2本の構文と concurrency の設定値を読み戻して
   確認した。
 
+## レビュー指摘への修正（2026-11-19、code-review の should-fix 2件）
+
+対象レビュー: `2026-11-19-issue41-code-review.md`（最終見解は
+マージ可、must-fix 0件、should-fix 2件）。
+
+### S-1: run_update の結合の向き（目録側の失敗の分離）
+
+- `run_update` で書類目録の読み取り・集計・反映
+  （`download_catalog_rows` → `aggregate_catalog_submissions` →
+  `refresh_last_submissions`）を失敗分離した。目録側が失敗しても
+  例外は上に伝わらず、スナップショットの適用と状態の保存は
+  そのまま完結する。
+- 失敗時は `last_submissions` を反映前の状態へ戻し、失敗の内容を
+  summary の `last_submissions_refresh` に `error_kind` と
+  `error` として記録する（統計の各件数は 0）。S2-T5 塊3レビューの
+  S-1 と同型の直し方である。
+- 回帰テスト 2件を追加した（`RunUpdateCatalogTest`）: 目録の
+  読み取りが例外を投げる場合と、目録の行が壊れていて集計が
+  例外を投げる場合のどちらでも、スナップショットが適用され、
+  summary に失敗が記録され、保存された `last_submissions` が
+  変更されていないことを固定する。修正前のコードではこの
+  2件が失敗することを確認した。
+
+### S-2: 一意化のタイブレーク規則のテスト固定
+
+- `aggregate_catalog_submissions` の「同一 docID で提出日が
+  食い違う場合は新しい方を採る」規則を固定するテストを 1件
+  追加した（`AggregateCatalogSubmissionsTest`）。新しい日付が
+  先に現れる順序と後に現れる順序の両方を含み、どちらの順序
+  でも新しい方が残ることを確認する。
+- 突然変異（一意化を常に後勝ちの上書きへ変える）でこのテスト
+  が失敗することを確認した。変異の下では他の集計テスト 2件は
+  合格のままであり、タイブレークを縛っているのはこのテスト
+  である。
+
+### 検証（修正分）
+
+- 修正前（head b8700b5c）: 全テスト 223件合格。新規テスト 3件を
+  先に加えた状態では 226件中 S-1 の回帰テスト 2件が失敗した。
+- 修正後: 全テスト 226件合格（223件 + 新規 3件）。
+
 ## 残手順（マージ後、メイン側）
 
 - daily_codelist を dispatch し、company-master-update ジョブが
