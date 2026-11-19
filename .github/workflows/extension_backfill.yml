@@ -1,0 +1,78 @@
+name: extension_backfill
+
+# Issue #25 (P2-T10) 残件: 過去分 (バックフィル期間) の拡張要素の
+# 表示名を、v1 (固定リビジョン、読み取り専用) の日次 tar 内の提出 zip
+# から抽出し、parse/month=<月>/extension_labels.jsonl へマージする。
+# 出所は dictionary/backfill/month=<月>/catalog.jsonl、進捗は同
+# ledger.jsonl に残るため、中断しても再 dispatch で続きから進む。
+# - 抽出は pipeline.parse.extract_facts (arelle) を使うため、
+#   daily_parse と同じ arelle の固定版を入れる。
+# - 索引はバックフィルと同じ固定リビジョンを取得し、SHA-256 を
+#   照合してから使う (母数の確定のため)。
+# - アップロードは日単位 (台帳・ラベル・出所・要約で最大4コミット)。
+#   月あたり最大でも数十コミットが数時間に分散する頻度であり、
+#   2026-11-15 に疑われた書き込みレート制限 (約19分で約115コミット)
+#   の水準より十分に低い。制限が再発する場合は日単位の公開を
+#   5日単位へ落とすことが切り分けの第一手になる。
+# - 同時実行は concurrency で直列化する (ラベルファイルの
+#   マージアップロードが競合しないように)。
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "対象月 (YYYY-MM、カンマ区切りで複数可)"
+        required: true
+        type: string
+      max_docs:
+        description: "1か月あたりの処理書類数の上限 (空なら無制限。分割実行用)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extension-backfill-write
+  cancel-in-progress: false
+
+jobs:
+  extension-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install arelle-release==2.47.5
+      - name: Download pinned index from HF v1 (read-only)
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          curl -fL --retry 5 --retry-all-errors --retry-delay 5 -o work/index.parquet \
+            "https://huggingface.co/datasets/Yoshi-Dai/financial-lakehouse/resolve/43540407ea82f792551e145598b1cf50cde6cb78/catalog/documents_index.parquet"
+          echo "68a8c01ea8cc1c952eeeb4b3b1eebf2dd52a3b56b511c45a8f9154b601512997  work/index.parquet" | sha256sum -c -
+      - name: Run extension label backfill
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MONTHS: ${{ inputs.months }}
+          MAX_DOCS: ${{ inputs.max_docs }}
+        run: |
+          set -euo pipefail
+          args=(--index work/index.parquet
+                --work-dir work/extension-backfill
+                run --months "$MONTHS" --upload)
+          if [ -n "$MAX_DOCS" ]; then args+=(--max-docs "$MAX_DOCS"); fi
+          python -m pipeline.extension_backfill "${args[@]}"
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-backfill-${{ inputs.months }}
+          path: |
+            work/extension-backfill/ledger/*.jsonl
+          if-no-files-found: warn

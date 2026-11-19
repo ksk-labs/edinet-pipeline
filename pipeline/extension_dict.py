@@ -25,11 +25,12 @@ parse/month=YYYY-MM/extension_labels.jsonl (書類ごとの拡張要素と
   表示名が食い違う場合も、行は書類ごとに残したうえでサマリの
   label_conflicts に記録する (どちらが正かは辞書側では決めない)。
 
-過去分 (バックフィル済み Silver の期間) には extension_labels が
-無い。その期間の表示名は tar / zip から別途抽出した
-extension_labels 形式の JSONL を同じ build に渡すことで取り込める
-(抽出自体は pipeline.parse の extract_facts が担う既存経路であり、
-本モジュールの範囲は「JSONL から辞書を構築する」まで)。
+過去分 (バックフィル済み Silver の期間) の表示名は
+pipeline.extension_backfill が原形 zip から抽出して同じ
+extension_labels.jsonl へマージする。出所は v1 索引から合成した行を
+dictionary/backfill/month=<月>/catalog.jsonl に置き、sync は実観測の
+書類目録に加えてこの合成行も読む (catalog_index の優先規則により
+実観測の行が優先される)。
 
 冪等性: 辞書は入力 JSONL 全部からの再構築であり、同じ入力からは
 同じ行集合 (ソート済み) が得られる。sync は対象月の入力をすべて
@@ -358,6 +359,18 @@ def sync(repo, months, work_dir, upload=False, allow_partial_upload=False):
                 work_dir, "inputs", catalog_path.replace("/", "_"))
             if _download(api, repo, catalog_path, local_cat):
                 local_catalogs.append(local_cat)
+        # 過去分 (バックフィル期間) の出所は pipeline.extension_backfill
+        # が v1 索引から合成して dictionary/backfill/ に置く。
+        # catalog_index は fetched_at の大きい行を優先するため、
+        # 実観測の行がある書類では合成行は使われない。
+        backfill_catalog_path = \
+            f"dictionary/backfill/month={month}/catalog.jsonl"
+        if backfill_catalog_path in remote:
+            local_bf = os.path.join(
+                work_dir, "inputs",
+                backfill_catalog_path.replace("/", "_"))
+            if _download(api, repo, backfill_catalog_path, local_bf):
+                local_catalogs.append(local_bf)
 
     out_path = os.path.join(work_dir, "extension_elements.parquet")
     summary_path = os.path.join(work_dir, "extension_elements_summary.json")

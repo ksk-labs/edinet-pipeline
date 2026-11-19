@@ -250,5 +250,37 @@ class SyncPartialUploadTest(unittest.TestCase):
         self.assertEqual(self.uploads, [])
 
 
+class SyncBackfillCatalogTest(unittest.TestCase):
+    """sync は過去分の出所 (dictionary/backfill/) も併せて読む。"""
+
+    REMOTE = [
+        "parse/month=2026-11/extension_labels.jsonl",
+        "catalog/month=2026-11/ledger.jsonl",
+        "dictionary/backfill/month=2026-11/catalog.jsonl",
+    ]
+
+    def test_backfill_catalog_is_passed_to_build(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        api = mock.MagicMock()
+        api.list_repo_files.return_value = list(self.REMOTE)
+        captured = {}
+
+        def fake_build(label_paths, catalog_paths, out_path, summary_path):
+            captured["labels"] = list(label_paths)
+            captured["catalogs"] = list(catalog_paths)
+            return {"output_rows": 0}
+
+        with mock.patch.object(ed, "HfApi", return_value=api), \
+                mock.patch.object(ed, "_download", return_value=True), \
+                mock.patch.object(ed, "build_from_files",
+                                  side_effect=fake_build):
+            ed.sync("repo", ["2026-11"], tmp, upload=False)
+        self.assertEqual(len(captured["labels"]), 1)
+        self.assertEqual(len(captured["catalogs"]), 2)
+        self.assertTrue(any("dictionary_backfill" in p
+                            for p in captured["catalogs"]))
+
+
 if __name__ == "__main__":
     unittest.main()
