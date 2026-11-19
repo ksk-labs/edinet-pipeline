@@ -14,13 +14,17 @@ import unittest
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from unittest import mock
+
 from pipeline.company_master import ATTRIBUTE_SCHEMA
 from pipeline.text_layer import (
     CATEGORIES,
     build_items,
     build_observations,
     classify_element,
+    main,
     run_build,
+    run_download,
     split_representative,
     to_attribute_rows,
 )
@@ -314,6 +318,70 @@ class RunBuildTest(unittest.TestCase):
                       encoding="utf-8") as f:
                 saved = json.load(f)
             self.assertEqual(saved["items_total"], 2)
+
+
+class RunDownloadTest(unittest.TestCase):
+    """download の配置が HF キャッシュのリンクに依存しないことを固定する。
+
+    hf_hub_download はキャッシュ内の相対シンボリックリンクを返す。
+    配置先へ rename で移すとリンク先が解決できず開けなくなる
+    (Issue #57) ため、配置は実体のコピーでなければならない。
+    """
+
+    PAYLOADS = {
+        "raw/edinet/2026/11/17/zip/S100ZI7X.zip": b"zip-bytes",
+        "master/edinet_codes.parquet": b"parquet-bytes",
+    }
+
+    def _fake_hf_hub_download(self, cache_root, requested):
+        def fake(repo_id, filename, repo_type, local_dir=None):
+            requested.append(filename)
+            blob = os.path.join(cache_root, "blobs",
+                                filename.replace("/", "_"))
+            os.makedirs(os.path.dirname(blob), exist_ok=True)
+            with open(blob, "wb") as f:
+                f.write(self.PAYLOADS[filename])
+            snap = os.path.join(cache_root, "snapshots", filename)
+            os.makedirs(os.path.dirname(snap), exist_ok=True)
+            os.symlink(os.path.relpath(blob, os.path.dirname(snap)), snap)
+            return snap
+        return fake
+
+    def _run(self, argv_download):
+        with tempfile.TemporaryDirectory() as tmp:
+            requested = []
+            fake = self._fake_hf_hub_download(
+                os.path.join(tmp, "cache"), requested)
+            zip_out = os.path.join(tmp, "work", "filing.zip")
+            master_dir = os.path.join(tmp, "work", "master")
+            with mock.patch("pipeline.text_layer.hf_hub_download", fake):
+                argv_download(zip_out, master_dir)
+            self.assertEqual(requested, list(self.PAYLOADS))
+            for dest, payload in (
+                    (zip_out, self.PAYLOADS[
+                        "raw/edinet/2026/11/17/zip/S100ZI7X.zip"]),
+                    (os.path.join(master_dir, "edinet_codes.parquet"),
+                     self.PAYLOADS["master/edinet_codes.parquet"])):
+                self.assertFalse(os.path.islink(dest))
+                with open(dest, "rb") as f:
+                    self.assertEqual(f.read(), payload)
+
+    def test_run_download_places_real_files(self):
+        def call(zip_out, master_dir):
+            result = run_download(
+                "Yoshi-Dai/financial-lakehouse-v2", "S100ZI7X",
+                "2026-11-17", zip_out, master_dir)
+            self.assertEqual(result, {"zip": zip_out, "master": os.path.join(
+                master_dir, "edinet_codes.parquet")})
+        self._run(call)
+
+    def test_main_download_places_real_files(self):
+        def call(zip_out, master_dir):
+            rc = main(["download", "--doc-id", "S100ZI7X",
+                       "--submit-date", "2026-11-17",
+                       "--zip-out", zip_out, "--master-dir", master_dir])
+            self.assertEqual(rc, 0)
+        self._run(call)
 
 
 if __name__ == "__main__":
