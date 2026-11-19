@@ -318,7 +318,9 @@ def run_acquire(index_path, work_dir, repo=DEFAULT_REPO, client=None,
                 summary["failed_doc_ids"].append(entry["doc_id"])
         for entry in failed_entries:
             acq.append(entry)
-        push_acquisition_ledger()
+        # 追記0件で遠隔目録も無い月は state ファイル自体が無い
+        if os.path.exists(acq_local):
+            push_acquisition_ledger()
         if summary["stopped_early"]:
             break
 

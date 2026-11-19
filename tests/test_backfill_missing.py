@@ -275,6 +275,39 @@ class RunAcquireTest(unittest.TestCase):
         self.assertEqual(summary["downloaded"], 1)
         self.assertEqual(summary["acquired_doc_ids"], ["OK1"])
 
+    def test_max_docs_exhausted_before_next_month_does_not_crash(self):
+        # max_docs が月の途中で枯渇し、次の月に追記0件で到達しても
+        # 落ちないこと（2026-11-19 の小規模確認で実発生した欠陥）。
+        # 2026-03 分の取得目録は遠隔にも無く、ローカルの state
+        # ファイル自体が存在しないため、月末の無条件 push が
+        # ValueError で落ちていた。
+        index_path = os.path.join(self.tmp.name, "index_next.parquet")
+        write_index(index_path, [
+            index_row("FIRST1", "2024-11-15 09:05"),
+            index_row("NEXT1", "2026-03-05 09:04"),
+            index_row("NEXT2", "2026-03-05 09:05"),
+        ])
+        client = FakeClient(bodies={"FIRST1": ZIP_BODY,
+                                    "NEXT1": ZIP_BODY, "NEXT2": ZIP_BODY})
+        summary = backfill_missing.run_acquire(
+            index_path, os.path.join(self.tmp.name, "work_next"),
+            repo="fake/repo", client=client, max_docs=1)
+        self.assertTrue(summary["stopped_early"])
+        self.assertEqual(summary["attempted"], 1)
+        self.assertEqual(summary["acquired_doc_ids"], ["FIRST1"])
+        # 2026-03 分は試行すらされず、上げる取得目録も無い
+        self.assertNotIn("acquisition/month=2026-03/ledger.jsonl",
+                         self.remote)
+        self.assertNotIn(("NEXT1", 1), client.doc_calls)
+        self.assertNotIn(("NEXT2", 1), client.doc_calls)
+        # 実行サマリが書き出され、後段が続きから進める状態である
+        out_dir = os.path.join(self.tmp.name, "work_next", "out")
+        with open(os.path.join(out_dir, "run_summary.json"),
+                  encoding="utf-8") as f:
+            written = json.load(f)
+        self.assertTrue(written["stopped_early"])
+        self.assertEqual(written["acquired_doc_ids"], ["FIRST1"])
+
     def test_list_failure_falls_back_to_index(self):
         client = FakeClient(
             bodies={"OK1": ZIP_BODY, "NG1": ZIP_BODY},
