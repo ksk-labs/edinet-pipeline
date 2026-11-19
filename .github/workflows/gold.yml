@@ -13,12 +13,21 @@ name: gold
 # - since_month: build / update の対象開始月 (YYYY-MM)。空なら
 #   pipeline.gold の既定値 2021-11 (第1期) を使う。全期間の再生成は
 #   2016-03 を指定する (第2期 Silver を含む全129か月が対象になる)。
-# 日次の定期実行への配線は、Silver 側の日次運転の観測と合わせて
-# 後続作業とする (本ワークフローは手動 dispatch の経路を用意する)。
+# 日次の定期実行 (Issue #50): 主経路は daily_parse の後段ジョブ
+# (gold-update) で、Silver へ反映された差分へ同じ run の中で追随
+# する。本ワークフローの schedule は、daily_parse の run 自体が
+# 起動しなかった日の回収を担う予備経路で、毎日 20:30 JST に
+# update を全期間 (since_month=2016-03) で実行する。update は
+# 透かしによる差分検出で冪等であり、主経路と重なっても二重には
+# 適用されない。手動 dispatch・schedule・後段ジョブの競合は、
+# concurrency グループ gold-write (リポジトリ全体で有効) を
+# 共有し、cancel-in-progress: false と queue: max で直列化して防ぐ。
 # 必要な秘密は HF_TOKEN のみ (入力の読み取りは公開データセットと
 # v2 上の登録簿の写しのため不要)。
 
 on:
+  schedule:
+    - cron: "30 11 * * *"  # 毎日 20:30 JST (Issue #50 の予備経路)
   workflow_dispatch:
     inputs:
       command:
@@ -43,6 +52,10 @@ jobs:
   gold:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    concurrency:
+      group: gold-write
+      cancel-in-progress: false
+      queue: max
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -56,8 +69,13 @@ jobs:
           COMMAND: ${{ inputs.command }}
           REGISTRY_YAML: ${{ inputs.registry_yaml }}
           SINCE_MONTH: ${{ inputs.since_month }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            COMMAND=update
+            SINCE_MONTH=2016-03
+          fi
           mkdir -p work/gold
           if [ "$COMMAND" = "sync-registry" ]; then
             if [ -z "$REGISTRY_YAML" ]; then
