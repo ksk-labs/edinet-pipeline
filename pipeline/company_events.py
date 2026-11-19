@@ -1,9 +1,39 @@
-"""会社イベントと親子関係 (P2-T4、仕様 #15 §5)。
+"""会社イベントと親子関係 (P2-T4、Issue #43、仕様 #15 §5)。
 
 臨時報告書の提出事由 (府令の条項) をイベント種別へ対応づけて
 会社イベントとして取り込み、親会社等状況報告書のメタデータから
 親子関係を時点つきで記録する。成果物は v2 データセット
 (Yoshi-Dai/financial-lakehouse-v2) の master/ 配下に置く。
+
+Issue #43 (P2-T4 の後続) で、公開買付け関係書類・大量保有報告書・
+自己株券買付状況報告書も同じ器へ取り込むように拡張した。実測と
+設計判断の正本は作業記録
+docs/records/2026-11-19-issue43-tob-events-work-record.md であり、
+要点は次のとおり。
+
+- イベントの単位は書類 (原書類1件 = イベント1件) で、種別は
+  書類種別から決める。訂正書類 (doc_type=250・280・300・320・
+  360・230) は新しいイベントとして数えず、系統ごとに件数だけを
+  サマリに残す (P2-T4 の訂正の一本化と同じ方針)。
+- 関係先はメタデータから決定的に取れる範囲で埋める: 公開買付系
+  は subject_edinet_code (対象者)、大量保有は
+  issuer_edinet_code (発行会社)。自己株券買付状況報告書には
+  相手先の会社のメタデータが無いため null とする。
+- 関係 (company_relationships) は relation_kind で意味を分ける。
+  parent_subsidiary は親会社等状況報告書からの親子関係
+  (parent_* = 親会社等、subsidiary_* = 上場子会社)。
+  tender_offer は parent_* = 買付者、subsidiary_* = 対象者で、
+  意見表明報告書 (doc_type=290) だけは提出者が対象者であるため
+  提出者と subject を入れ替えて向きをそろえる (実測: 連鎖で
+  検証可能な 476 件全件で、290 の提出者が親の公開買付届出書の
+  対象者と一致した)。large_holding は parent_* = 保有者、
+  subsidiary_* = 発行会社。集約キーは (親側コード, 子側コード,
+  relation_kind) で、同じ組でも種別が違えば別の行にする。
+- 大量保有の初回 (大量保有報告書) と変更 (変更報告書) は
+  タイトルの接頭辞で切り分ける。対象期間のタイトルは5種すべて
+  がどちらかの接頭辞を持っていた (実測)。
+- 本文由来の構造化 (公開買付の条件、保有割合、買付の取得状況)
+  は P2-T4 と同じく行わない。器の列は null のまま残す。
 
 master/ への追加分 (本モジュールが正本):
 - company_events.parquet: 会社イベント。行は (源泉書類, 提出事由の
@@ -49,12 +79,13 @@ master/ への追加分 (本モジュールが正本):
 親子関係の源泉と範囲:
 - 親会社等状況報告書 (v1 索引の doc_type=200): 提出者が親会社等、
   subsidiary_edinet_code が上場子会社を指す。841件 (訂正含む)
-  の観測があり、本チケットではこの源泉だけを関係として取り込む。
+  の観測があり、P2-T4 ではこの源泉だけを関係として取り込んだ。
 - 書類メタデータの issuer / subject コードは、実測では大量保有
   報告書系 (issuer) と公開買付け関係書類系 (subject) にしか
-  現れない。これらの書類の取り込みは後続チケットの範囲であり、
-  関係の器への投入もそのチケットに合わせる。有報の関係会社の
-  状況はテキストであり、テキスト層 (P2-T7) の範囲。
+  現れない。この2系統の取り込みは Issue #43 で行い、関係の器へ
+  relation_kind を分けて投入する (冒頭の Issue #43 の節を参照)。
+  有報の関係会社の状況はテキストであり、テキスト層 (P2-T7)
+  の範囲。
 - 臨時報告書の第3号 (親会社・特定子会社の異動) はイベントとして
   取り込むが、相手先は本文の名称のみで EDINET コードが無いため、
   関係の辺としては記録しない。
@@ -110,6 +141,46 @@ DOC_TYPE_EXTRAORDINARY = "180"
 DOC_TYPE_EXTRAORDINARY_AMENDMENT = "190"
 DOC_TYPE_PARENT_REPORT = "200"
 DOC_TYPE_PARENT_REPORT_AMENDMENT = "210"
+
+# Issue #43 の対象書類 (v1 索引の doc_type、タイトルで実測した対応)
+DOC_TYPE_TOB_FILING = "240"
+DOC_TYPE_TOB_FILING_AMENDMENT = "250"
+DOC_TYPE_TOB_WITHDRAWAL = "260"
+DOC_TYPE_TOB_REPORT = "270"
+DOC_TYPE_TOB_REPORT_AMENDMENT = "280"
+DOC_TYPE_TOB_OPINION = "290"
+DOC_TYPE_TOB_OPINION_AMENDMENT = "300"
+DOC_TYPE_TOB_QA_RESPONSE = "310"
+DOC_TYPE_TOB_QA_RESPONSE_AMENDMENT = "320"
+DOC_TYPE_LARGE_HOLDING = "350"
+DOC_TYPE_LARGE_HOLDING_AMENDMENT = "360"
+DOC_TYPE_BUYBACK_STATUS = "220"
+DOC_TYPE_BUYBACK_STATUS_AMENDMENT = "230"
+
+# 書類種別 -> (イベント種別, 日本語ラベル)。大量保有 (350) は
+# タイトルで初回と変更を切り分けるため、ここには入れない。
+DOCUMENT_EVENT_KIND_BY_DOC_TYPE = {
+    DOC_TYPE_TOB_FILING: ("tender_offer_filing", "公開買付届出"),
+    DOC_TYPE_TOB_WITHDRAWAL: ("tender_offer_withdrawal", "公開買付撤回"),
+    DOC_TYPE_TOB_REPORT: ("tender_offer_report", "公開買付報告書"),
+    DOC_TYPE_TOB_OPINION: ("tender_offer_opinion", "意見表明"),
+    DOC_TYPE_TOB_QA_RESPONSE: ("tender_offer_qa_response", "対質問回答"),
+    DOC_TYPE_BUYBACK_STATUS: ("share_buyback_status", "自己株券買付状況"),
+}
+
+LARGE_HOLDING_INITIAL_KIND = ("large_holding_report", "大量保有報告書")
+LARGE_HOLDING_CHANGE_KIND = ("large_holding_change_report",
+                             "変更報告書（大量保有）")
+
+# 訂正書類の doc_type -> 系統名 (サマリの内訳用)
+AMENDMENT_FAMILY_BY_DOC_TYPE = {
+    DOC_TYPE_TOB_FILING_AMENDMENT: "tender_offer",
+    DOC_TYPE_TOB_REPORT_AMENDMENT: "tender_offer",
+    DOC_TYPE_TOB_OPINION_AMENDMENT: "tender_offer",
+    DOC_TYPE_TOB_QA_RESPONSE_AMENDMENT: "tender_offer",
+    DOC_TYPE_LARGE_HOLDING_AMENDMENT: "large_holding",
+    DOC_TYPE_BUYBACK_STATUS_AMENDMENT: "buyback",
+}
 
 ORDINANCE_CORPORATE = "企業内容等の開示に関する内閣府令"
 ORDINANCE_SPECIFIED = "特定有価証券の内容等の開示に関する内閣府令"
@@ -221,6 +292,8 @@ UNCLASSIFIED_KIND = "unclassified"
 UNCLASSIFIED_LABEL = "未分類"
 
 RELATION_KIND_PARENT_SUBSIDIARY = "parent_subsidiary"
+RELATION_KIND_TENDER_OFFER = "tender_offer"
+RELATION_KIND_LARGE_HOLDING = "large_holding"
 
 EVENT_SCHEMA = pa.schema([
     ("event_id", pa.string()),
@@ -381,6 +454,158 @@ def build_events(rows, code_to_id, since, generated_at, source_sha256):
     return events, stats
 
 
+def classify_large_holding_title(title):
+    """大量保有 (doc_type=350) のタイトルを初回／変更へ切り分ける。
+
+    対象期間のタイトルは5種すべてが「大量保有報告書」または
+    「変更報告書」の接頭辞を持っていた (実測)。接頭辞の無い
+    タイトルは None を返し、呼び出し側は変更側へ倒して
+    未知タイトルとして数える。
+    """
+    if title and title.startswith("大量保有報告書"):
+        return "initial"
+    if title and title.startswith("変更報告書"):
+        return "change"
+    return None
+
+
+def build_document_events(rows, code_to_id, since, generated_at,
+                          source_sha256):
+    """公開買付・大量保有・自己株券買付の書類からイベントを作る。
+
+    rows は doc_type / submit_at / edinet_code / doc_id / title /
+    issuer_edinet_code / subject_edinet_code を持つ辞書の列。
+    対象は Issue #43 の原書類で提出日が since 以降のもの。
+    訂正書類はイベントにせず、系統ごとの件数だけを返す。
+    イベントの単位は書類1件で、関係先は公開買付系が subject、
+    大量保有が issuer、自己株券買付は None (相手先の会社の
+    メタデータが無い) とする。
+    """
+    prov = _provenance(generated_at, source_sha256)
+    events = []
+    stats = {
+        "tender_offer_filings": 0,
+        "large_holding_filings": 0,
+        "buyback_filings": 0,
+        "amendments_excluded": collections.Counter(),
+        "unresolved_filer_codes": 0,
+        "unresolved_related_codes": 0,
+        "unresolved_related_distinct_codes": set(),
+        "unknown_large_holding_titles": collections.Counter(),
+        "events_by_kind": collections.Counter(),
+    }
+    for row in rows:
+        submit_at = row.get("submit_at") or ""
+        if submit_at[:10] < since:
+            continue
+        doc_type = row.get("doc_type")
+        family = AMENDMENT_FAMILY_BY_DOC_TYPE.get(doc_type)
+        if family is not None:
+            stats["amendments_excluded"][family] += 1
+            continue
+        if doc_type == DOC_TYPE_LARGE_HOLDING:
+            title_kind = classify_large_holding_title(row.get("title"))
+            if title_kind is None:
+                stats["unknown_large_holding_titles"][row.get("title")] += 1
+            kind, label = (LARGE_HOLDING_INITIAL_KIND
+                           if title_kind == "initial"
+                           else LARGE_HOLDING_CHANGE_KIND)
+            related = row.get("issuer_edinet_code")
+            stats["large_holding_filings"] += 1
+        elif doc_type in DOCUMENT_EVENT_KIND_BY_DOC_TYPE:
+            kind, label = DOCUMENT_EVENT_KIND_BY_DOC_TYPE[doc_type]
+            if doc_type == DOC_TYPE_BUYBACK_STATUS:
+                related = None
+                stats["buyback_filings"] += 1
+            else:
+                related = row.get("subject_edinet_code")
+                stats["tender_offer_filings"] += 1
+        else:
+            continue
+        code = row.get("edinet_code")
+        internal_id = code_to_id.get(code)
+        if internal_id is None:
+            stats["unresolved_filer_codes"] += 1
+        related_id = None
+        if related:
+            related_id = code_to_id.get(related)
+            if related_id is None:
+                stats["unresolved_related_codes"] += 1
+                stats["unresolved_related_distinct_codes"].add(related)
+        stats["events_by_kind"][kind] += 1
+        events.append({
+            "event_id": f"{row['doc_id']}#1",
+            "internal_id": internal_id,
+            "edinet_code": code,
+            "event_kind": kind,
+            "event_kind_label": label,
+            "ordinance": None,
+            "reason_atom": None,
+            "reason_raw": None,
+            "disclosed_at": submit_at,
+            "disclosure_date": submit_at[:10],
+            "event_date": None,
+            "related_edinet_code": related,
+            "related_internal_id": related_id,
+            "split_ratio": None,
+            "effective_date": None,
+            "source_doc_id": row["doc_id"],
+            **prov,
+        })
+    events.sort(key=lambda e: (e["disclosure_date"], e["disclosed_at"],
+                               e["event_id"]))
+    stats["amendments_excluded"] = dict(stats["amendments_excluded"])
+    stats["unknown_large_holding_titles"] = dict(
+        stats["unknown_large_holding_titles"])
+    stats["unresolved_related_distinct_codes"] = len(
+        stats["unresolved_related_distinct_codes"])
+    stats["events_by_kind"] = dict(stats["events_by_kind"])
+    stats["events_total"] = len(events)
+    return events, stats
+
+
+def _aggregate_pairs(observations, code_to_id, relation_kind, prov):
+    """(親側コード, 子側コード, 日付, 書類 ID) の観測を組へ集約する。
+
+    observations は (提出日時, 書類 ID) の昇順で渡すこと。
+    初回・最終の観測日と観測回数、最初と最後の源泉書類を持つ
+    行を返す。自己組と未解決の組は stats に数える。
+    """
+    pairs = {}
+    stats = {"self_pairs": 0, "unresolved_codes": 0}
+    for parent, subsidiary, date, doc_id in observations:
+        key = (parent, subsidiary)
+        entry = pairs.get(key)
+        if entry is None:
+            entry = {
+                "parent_internal_id": code_to_id.get(parent),
+                "parent_edinet_code": parent,
+                "subsidiary_internal_id": code_to_id.get(subsidiary),
+                "subsidiary_edinet_code": subsidiary,
+                "relation_kind": relation_kind,
+                "first_observed_date": date,
+                "last_observed_date": date,
+                "observation_count": 0,
+                "first_source_doc_id": doc_id,
+                "last_source_doc_id": doc_id,
+                **prov,
+            }
+            pairs[key] = entry
+            if parent == subsidiary:
+                stats["self_pairs"] += 1
+            if (entry["parent_internal_id"] is None
+                    or entry["subsidiary_internal_id"] is None):
+                stats["unresolved_codes"] += 1
+        entry["last_observed_date"] = date
+        entry["last_source_doc_id"] = doc_id
+        entry["observation_count"] += 1
+    relationships = sorted(
+        pairs.values(),
+        key=lambda e: (e["parent_edinet_code"], e["subsidiary_edinet_code"]))
+    stats["relationship_pairs"] = len(relationships)
+    return relationships, stats
+
+
 def build_relationships(rows, code_to_id, since, generated_at,
                         source_sha256):
     """親会社等状況報告書の観測から親子関係を集約する。
@@ -389,16 +614,14 @@ def build_relationships(rows, code_to_id, since, generated_at,
     (doc_type=210) は観測として数えず、件数だけをサマリに残す。
     """
     prov = _provenance(generated_at, source_sha256)
-    pairs = {}
     stats = {
         "parent_report_filings": 0,
         "parent_report_amendments_excluded": 0,
-        "self_pairs": 0,
-        "unresolved_codes": 0,
     }
     ordered = sorted(
         (r for r in rows if (r.get("submit_at") or "")[:10] >= since),
         key=lambda r: (r.get("submit_at") or "", r.get("doc_id") or ""))
+    observations = []
     for row in ordered:
         if row.get("doc_type") == DOC_TYPE_PARENT_REPORT_AMENDMENT:
             stats["parent_report_amendments_excluded"] += 1
@@ -409,44 +632,107 @@ def build_relationships(rows, code_to_id, since, generated_at,
         if not subsidiary:
             continue
         stats["parent_report_filings"] += 1
-        parent = row.get("edinet_code")
-        date = (row.get("submit_at") or "")[:10]
-        key = (parent, subsidiary)
-        entry = pairs.get(key)
-        if entry is None:
-            entry = {
-                "parent_internal_id": code_to_id.get(parent),
-                "parent_edinet_code": parent,
-                "subsidiary_internal_id": code_to_id.get(subsidiary),
-                "subsidiary_edinet_code": subsidiary,
-                "relation_kind": RELATION_KIND_PARENT_SUBSIDIARY,
-                "first_observed_date": date,
-                "last_observed_date": date,
-                "observation_count": 0,
-                "first_source_doc_id": row["doc_id"],
-                "last_source_doc_id": row["doc_id"],
-                **prov,
-            }
-            pairs[key] = entry
-            if parent == subsidiary:
-                stats["self_pairs"] += 1
-            if (entry["parent_internal_id"] is None
-                    or entry["subsidiary_internal_id"] is None):
-                stats["unresolved_codes"] += 1
-        entry["last_observed_date"] = date
-        entry["last_source_doc_id"] = row["doc_id"]
-        entry["observation_count"] += 1
-    relationships = sorted(
-        pairs.values(),
-        key=lambda e: (e["parent_edinet_code"], e["subsidiary_edinet_code"]))
-    stats["relationship_pairs"] = len(relationships)
+        observations.append((
+            row.get("edinet_code"), subsidiary,
+            (row.get("submit_at") or "")[:10], row["doc_id"]))
+    relationships, agg_stats = _aggregate_pairs(
+        observations, code_to_id, RELATION_KIND_PARENT_SUBSIDIARY, prov)
+    stats.update(agg_stats)
+    return relationships, stats
+
+
+# 公開買付系で (買付者, 対象者) の向きが提出者・subject と一致する書類
+_TOB_OFFEROR_IS_FILER = (DOC_TYPE_TOB_FILING, DOC_TYPE_TOB_WITHDRAWAL,
+                         DOC_TYPE_TOB_REPORT, DOC_TYPE_TOB_QA_RESPONSE)
+_TOB_AMENDMENTS = (DOC_TYPE_TOB_FILING_AMENDMENT,
+                   DOC_TYPE_TOB_REPORT_AMENDMENT,
+                   DOC_TYPE_TOB_OPINION_AMENDMENT,
+                   DOC_TYPE_TOB_QA_RESPONSE_AMENDMENT)
+
+
+def build_tender_offer_relationships(rows, code_to_id, since,
+                                     generated_at, source_sha256):
+    """公開買付け関係書類の観測から (買付者, 対象者) の関係を集約する。
+
+    観測は原書類からのみ数える。意見表明報告書 (doc_type=290)
+    は提出者が対象者のため、(買付者, 対象者) の向きにそろえて
+    subject と提出者を入れ替える。その他の原書類は提出者が
+    買付者、subject が対象者である (実測で裏取り済み)。
+    """
+    prov = _provenance(generated_at, source_sha256)
+    stats = {
+        "tender_offer_filings": 0,
+        "tender_offer_amendments_excluded": 0,
+    }
+    ordered = sorted(
+        (r for r in rows if (r.get("submit_at") or "")[:10] >= since),
+        key=lambda r: (r.get("submit_at") or "", r.get("doc_id") or ""))
+    observations = []
+    for row in ordered:
+        doc_type = row.get("doc_type")
+        if doc_type in _TOB_AMENDMENTS:
+            stats["tender_offer_amendments_excluded"] += 1
+            continue
+        if doc_type == DOC_TYPE_TOB_OPINION:
+            offeror = row.get("subject_edinet_code")
+            target = row.get("edinet_code")
+        elif doc_type in _TOB_OFFEROR_IS_FILER:
+            offeror = row.get("edinet_code")
+            target = row.get("subject_edinet_code")
+        else:
+            continue
+        if not offeror or not target:
+            continue
+        stats["tender_offer_filings"] += 1
+        observations.append((
+            offeror, target, (row.get("submit_at") or "")[:10],
+            row["doc_id"]))
+    relationships, agg_stats = _aggregate_pairs(
+        observations, code_to_id, RELATION_KIND_TENDER_OFFER, prov)
+    stats.update(agg_stats)
+    return relationships, stats
+
+
+def build_large_holding_relationships(rows, code_to_id, since,
+                                      generated_at, source_sha256):
+    """大量保有報告書の観測から (保有者, 発行会社) の関係を集約する。
+
+    対象は doc_type=350 で提出日が since 以降のもの。訂正
+    (doc_type=360) は観測として数えず、件数だけをサマリに残す。
+    """
+    prov = _provenance(generated_at, source_sha256)
+    stats = {
+        "large_holding_filings": 0,
+        "large_holding_amendments_excluded": 0,
+    }
+    ordered = sorted(
+        (r for r in rows if (r.get("submit_at") or "")[:10] >= since),
+        key=lambda r: (r.get("submit_at") or "", r.get("doc_id") or ""))
+    observations = []
+    for row in ordered:
+        if row.get("doc_type") == DOC_TYPE_LARGE_HOLDING_AMENDMENT:
+            stats["large_holding_amendments_excluded"] += 1
+            continue
+        if row.get("doc_type") != DOC_TYPE_LARGE_HOLDING:
+            continue
+        issuer = row.get("issuer_edinet_code")
+        if not issuer:
+            continue
+        stats["large_holding_filings"] += 1
+        observations.append((
+            row.get("edinet_code"), issuer,
+            (row.get("submit_at") or "")[:10], row["doc_id"]))
+    relationships, agg_stats = _aggregate_pairs(
+        observations, code_to_id, RELATION_KIND_LARGE_HOLDING, prov)
+    stats.update(agg_stats)
     return relationships, stats
 
 
 def load_index_rows(index_path):
     """v1 索引から必要な列だけを読む。"""
-    columns = ["doc_id", "edinet_code", "submit_at", "doc_type",
+    columns = ["doc_id", "edinet_code", "submit_at", "doc_type", "title",
                "current_report_reason", "subsidiary_edinet_code",
+               "issuer_edinet_code", "subject_edinet_code",
                "parent_doc_id"]
     table = pq.read_table(index_path, columns=columns)
     return table.to_pylist()
@@ -523,8 +809,21 @@ def run_build(work_dir, repo=DEFAULT_REPO, index_path=None, master_dir=None,
     code_to_id = load_code_to_id(master_dir)
     events, event_stats = build_events(rows, code_to_id, since,
                                        generated_at, source_sha256)
+    doc_events, doc_event_stats = build_document_events(
+        rows, code_to_id, since, generated_at, source_sha256)
+    events = sorted(events + doc_events,
+                    key=lambda e: (e["disclosure_date"],
+                                   e["disclosed_at"], e["event_id"]))
     relationships, rel_stats = build_relationships(
         rows, code_to_id, since, generated_at, source_sha256)
+    tob_relationships, tob_stats = build_tender_offer_relationships(
+        rows, code_to_id, since, generated_at, source_sha256)
+    lh_relationships, lh_stats = build_large_holding_relationships(
+        rows, code_to_id, since, generated_at, source_sha256)
+    relationships = sorted(
+        relationships + tob_relationships + lh_relationships,
+        key=lambda e: (e["parent_edinet_code"],
+                       e["subsidiary_edinet_code"], e["relation_kind"]))
     out_dir = os.path.join(work_dir, "master_out")
     write_outputs(events, relationships, out_dir)
     summary = {
@@ -545,7 +844,12 @@ def run_build(work_dir, repo=DEFAULT_REPO, index_path=None, master_dir=None,
             "events_total": event_stats["events_total"],
             "events_by_kind": dict(event_stats["events_by_kind"]),
         },
+        "document_events": doc_event_stats,
+        "events_total_all": len(events),
         "relationships": rel_stats,
+        "relationships_tender_offer": tob_stats,
+        "relationships_large_holding": lh_stats,
+        "relationships_total_all": len(relationships),
         "reserved_event_kinds": RESERVED_EVENT_KINDS,
     }
     with open(os.path.join(out_dir, SUMMARY_NAME), "w",
