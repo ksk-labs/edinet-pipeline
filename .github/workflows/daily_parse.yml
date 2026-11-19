@@ -8,6 +8,15 @@ name: daily_parse
 #   タクソノミのキャッシュ (arelle の webcache) は actions/cache で
 #   ジョブ間に使い回す。検証の別プロセスも同じキャッシュを使う。
 # - merge: 全 shard の結果を月別の Silver へ反映し、解析目録を push する。
+# - gold-update (Issue #50): merge の後段で Gold の日次差分更新
+#   (pipeline.gold update) を実行する。needs で同一 run の後段に
+#   置くため、スケジューラ遅延の影響を受けず、Silver へ反映された
+#   差分がそのまま Gold へ適用される。対象が0件で merge が実行
+#   されなかった日も、透かしの照合のため実行する (手動経路で
+#   Silver が変わった分の回収)。解析が失敗した日は実行せず、翌日
+#   の実行が透かしで回収する。対象期間は Gold の全期間に合わせて
+#   since_month=2016-03 とする。gold.yml との競合は concurrency
+#   グループ gold-write で直列化して防ぐ。
 # - workflow_dispatch: 日付を指定して手動実行する。date は提出日で、
 #   空なら未解析の全件が対象になる (doc_ids 指定時はそちらが優先)。
 # - schedule: 毎日 05:30 JST。date は空で実行し、未解析の全件を対象に
@@ -175,3 +184,36 @@ jobs:
           name: parse-merge-evidence
           path: work/merge-summary.json
           if-no-files-found: warn
+
+  gold-update:
+    needs: [plan, merge]
+    if: ${{ !cancelled() && (needs.merge.result == 'success' || needs.plan.outputs.targets == '0') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    concurrency:
+      group: gold-write
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run gold update
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/gold
+          python -m pipeline.gold update \
+            --work-dir work/gold --upload --since-month 2016-03 \
+            | tee work/gold/result.json
+      - name: Upload run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gold-update-result
+          path: work/gold/result.json
+          if-no-files-found: ignore
