@@ -371,5 +371,71 @@ class CompanyMasterMonitorTest(MonitorTestBase):
         self.assertEqual(report["alerts"], [])
 
 
+class GoldMonitorTest(MonitorTestBase):
+    """Issue #50: Gold の件数信号と、未反映の警報。"""
+
+    def put_gold(self, generated_at, annual=85191, quarterly=122682,
+                 dividends=81047, companies=5261):
+        self.put("gold/summary.json", _json_bytes({
+            "generated_at": generated_at,
+            "snapshot_date": generated_at[:10],
+            "annual_rows": annual, "quarterly_rows": quarterly,
+            "dividend_rows": dividends, "companies": companies}))
+
+    def put_parse_ok(self, parsed_at, doc_id="D1"):
+        self.put("parse/month=2026-11/ledger.jsonl", _jsonl_bytes([
+            {"doc_id": doc_id, "status": "ok", "rows": 10,
+             "parsed_at": parsed_at, "month": "2026-11"}]))
+
+    def test_current_gold_is_ok_and_signals_present(self):
+        self.put_acquisition_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17")
+        self.put_parse_ok("2026-11-16T10:00:00+00:00")
+        self.put_gold("2026-11-16T12:00:00+00:00")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["gold"]["status"], "ok")
+        self.assertEqual(report["gold"]["annual_rows"], 85191)
+        self.assertEqual(report["signals"]["gold_annual_rows"], 85191)
+        self.assertEqual(report["signals"]["gold_quarterly_rows"], 122682)
+        self.assertEqual(report["signals"]["gold_dividend_rows"], 81047)
+        self.assertEqual(report["signals"]["gold_companies"], 5261)
+        self.assertEqual(report["alerts"], [])
+
+    def test_stale_gold_alerts(self):
+        self.put_acquisition_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17")
+        self.put_parse_ok("2026-11-16T10:00:00+00:00")
+        self.put_gold("2026-11-15T12:00:00+00:00")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["gold"]["status"], "stale")
+        kinds = [a["kind"] for a in report["alerts"]]
+        self.assertEqual(kinds, ["gold_stale"])
+        alert = report["alerts"][0]
+        self.assertEqual(alert["latest_parse_date"], "2026-11-16")
+        self.assertIn("gold_stale", self.saved_state()["open_alerts"])
+
+    def test_missing_gold_is_reported_without_alert(self):
+        self.put_acquisition_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17")
+        self.put_parse_ok("2026-11-16T10:00:00+00:00")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["gold"]["status"], "missing")
+        self.assertIsNone(report["signals"]["gold_annual_rows"])
+        self.assertIsNone(report["signals"]["gold_companies"])
+        self.assertEqual(report["alerts"], [])
+
+    def test_same_day_parse_does_not_make_gold_stale(self):
+        self.put_acquisition_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17")
+        # 当日 (run_date) の解析は、その日の解析 run の後段で Gold が
+        # 更新される途中でありうるため、前日以前の生成でも警報にしない
+        self.put_parse_ok("2026-11-17T01:00:00+00:00")
+        self.put_gold("2026-11-15T12:00:00+00:00")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["gold"]["status"], "ok")
+        self.assertEqual(report["gold"]["latest_parse_date"], None)
+        self.assertEqual(report["alerts"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

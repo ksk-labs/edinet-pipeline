@@ -25,6 +25,9 @@
 監視信号として日々記録する。会社マスタ (Issue #41) は、会社数と
 最終提出日の行数を件数信号に載せ、適用済みスナップショットが
 最新のスナップショットに追いついていない場合に警報にする。
+Gold (Issue #50) は、各表の行数と会社数を件数信号に載せ、前日
+以前に Silver へ解析が追記された最新の日より Gold の生成日が
+古い場合に警報にする。
 """
 import argparse
 import json
@@ -204,6 +207,56 @@ def _judge_company_master(summary, latest_snapshot_date):
     }
 
 
+def _latest_parse_ok_date(parse_ledgers, target_date):
+    """target_date 以前に Silver へ解析が追記された最新の日 (JST)。
+
+    Gold の生成日との比較に使う。当日分の解析は、その日の解析 run
+    の後段で Gold が更新される途中でありうるため含めない。解析の
+    追記が無い場合は None。
+    """
+    latest = None
+    for entries in parse_ledgers.values():
+        for e in entries:
+            if e.get("status") != "ok":
+                continue
+            day = _jst_date(e.get("parsed_at"))
+            if day is not None and day <= target_date:
+                if latest is None or day > latest:
+                    latest = day
+    return latest
+
+
+def _judge_gold(summary, latest_parse_date):
+    """Gold の状態を判定する。戻り値は報告用の dict。
+
+    gold/summary.json が無い場合は missing とし、警報にはしない
+    (会社マスタと同じ扱い)。summary があり、前日以前に Silver へ
+    解析が追記された最新の日 (latest_parse_date) より Gold の生成日
+    (JST) が古い場合は stale とし、日次配線の停止を警報にする。
+    """
+    if summary is None:
+        return {"status": "missing", "generated_at": None,
+                "generated_date": None, "snapshot_date": None,
+                "annual_rows": None, "quarterly_rows": None,
+                "dividend_rows": None, "companies": None,
+                "latest_parse_date": latest_parse_date}
+    generated_date = _jst_date(summary.get("generated_at"))
+    stale = (latest_parse_date is not None
+             and (generated_date is None
+                  or generated_date < latest_parse_date))
+    return {
+        "status": "stale" if stale else "ok",
+        "generated_at": summary.get("generated_at"),
+        "generated_date": generated_date,
+        "snapshot_date": summary.get("snapshot_date"),
+        "annual_rows": summary.get("annual_rows"),
+        "quarterly_rows": summary.get("quarterly_rows"),
+        "dividend_rows": summary.get("dividend_rows"),
+        "companies": summary.get("companies"),
+        "latest_parse_date": latest_parse_date,
+    }
+
+
 def _judge_parse(acq_ledgers, parse_ledgers, run_date, target_date):
     """解析の状態 (当日の隔離、滞留、退避) を判定する。報告用の dict。"""
     parse_latest = {}
@@ -293,6 +346,11 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
     master_report = _judge_company_master(master_summary,
                                           _latest_snapshot_date(remote))
 
+    gold_summary = _load_json(api, repo, remote, "gold/summary.json",
+                              work_dir, "gold-summary.json")
+    gold_report = _judge_gold(
+        gold_summary, _latest_parse_ok_date(parse_ledgers, target_date))
+
     alerts = []
     unchecked = _unchecked_targets(prev_acq.get("last_checked_target"),
                                    target_date)
@@ -371,6 +429,17 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
                 master_report["last_applied_snapshot_date"],
             "latest_snapshot_date": master_report["latest_snapshot_date"],
         })
+    if gold_report["status"] == "stale":
+        alerts.append({
+            "kind": "gold_stale",
+            "detail": f"Gold の生成日 "
+                      f"({gold_report['generated_date']}) が、Silver へ"
+                      f"解析が追記された最新の日 "
+                      f"({gold_report['latest_parse_date']}) より古く、"
+                      "Silver の日次差分が Gold へ反映されていません",
+            "gold_generated_at": gold_report["generated_at"],
+            "latest_parse_date": gold_report["latest_parse_date"],
+        })
 
     report = {
         "date": run_date,
@@ -386,6 +455,7 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
             "retired_count": len(parse_report["retired"]),
         },
         "company_master": master_report,
+        "gold": gold_report,
         "signals": {
             "codelist_row_count": codelist_report["row_count"],
             "document_list_count": acq_report["list_count"],
@@ -394,6 +464,10 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
             "master_companies": master_report["companies"],
             "master_last_submissions_rows":
                 master_report["last_submissions_rows"],
+            "gold_annual_rows": gold_report["annual_rows"],
+            "gold_quarterly_rows": gold_report["quarterly_rows"],
+            "gold_dividend_rows": gold_report["dividend_rows"],
+            "gold_companies": gold_report["companies"],
         },
         "alerts": alerts,
     }
