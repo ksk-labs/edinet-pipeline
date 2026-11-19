@@ -52,7 +52,9 @@ master/ の構成 (本モジュールが正本):
   プレースホルダ)。v1 再構成の項目を引き継ぎ、更新時にも追加する。
 - last_submissions.parquet: 派生属性 (源泉の事実ではない) として、
   内部 ID × 書類種別ごとの最終提出日。初期値は history_from_v1 の
-  集計から作り、日次の更新は書類目録 (S2-T5) 側の経路で行う。
+  集計から作り、日次の更新 (update) では書類目録 (S2-T5 の取得経路が
+  v2 に積む catalog/) の集計で最終提出日と件数を更新する。目録は
+  取得経路が既に保存したものを読むだけであり、二重取得はしない。
 - state.json: 適用済みスナップショットの最終日と次の内部 ID。
   update の再開判定に使う。
 - summary.json: 構築・更新のサマリと照合結果。
@@ -79,6 +81,8 @@ reconstruct_v1 の従来実装は挿入順依存だったため、本チケッ�
 build / update は --snapshots-dir (EdinetcodeDlInfo.csv を含む
 ローカルディレクトリ) と --history-dir / --state-dir (ローカルの
 入力ディレクトリ) を受け付け、HF を介さない検証実行ができる。
+update は --catalog-dir (書類目録 JSONL のローカルディレクトリ) も
+受け付ける。
 認証は環境変数 HF_TOKEN (書き込み。huggingface_hub が自動で読む)。
 読み取りは公開データセットなのでトークンなしでも動く。
 """
@@ -111,6 +115,9 @@ HISTORY_PREFIX = "master/history_from_v1"
 V1_SOURCE_KIND = "v1_index"
 CODELIST_SOURCE_KIND = "edinet_codelist_download"
 CODELIST_SOURCE_ID = CODELIST_URL
+CATALOG_SOURCE_KIND = "edinet_api"
+CATALOG_SOURCE_ID = f"{DEFAULT_REPO}:catalog/month=*/ledger.jsonl"
+CATALOG_PREFIX = "catalog"
 REDISTRIBUTION_ALLOWED = "allowed"
 
 CODE_COLUMN = EXPECTED_COLUMNS[0]
@@ -1015,6 +1022,7 @@ def build_summary(state, applied, extra=None):
             if len(secs) > 1),
         "classifications": len(state["classifications"]),
         "review_items": len(state["review_items"]),
+        "last_submissions_rows": len(state["last_submissions"]),
         "review_items_by_type": dict(collections.Counter(
             r["item_type"] for r in state["review_items"])),
         "applied_snapshots": applied,
@@ -1058,6 +1066,119 @@ def compute_last_submissions(index_path, source_sha, generated_at):
         "source_file": V1_INDEX_PATH, "source_file_sha256": source_sha,
         "generated_at": generated_at, "redistributable": True,
     } for (ec, doc_type), a in sorted(agg.items())]
+
+
+def aggregate_catalog_submissions(rows):
+    """書類目録 (catalog/) の行を (EDINET コード, 書類種別) ごとに集計する。
+
+    目録は観測の追記であり、同じ書類 (docID) が複数回現れるため、
+    書類単位に一意化してから数える。一意化で提出日が食い違う場合は
+    新しい方を採る。docID と EDINET コードの無い行は数えない。
+    戻り値は {(コード, 種別): {"last": 最終提出日,
+    "by_date": Counter(提出日 -> 件数)}}。
+    """
+    docs = {}
+    for r in rows:
+        doc_id = r.get("docID")
+        code = r.get("edinetCode")
+        if not doc_id or not code:
+            continue
+        date = (r.get("submitDateTime") or "")[:10]
+        if not date:
+            continue
+        prev = docs.get(doc_id)
+        if prev is None or date > prev[2]:
+            docs[doc_id] = (code, r.get("docTypeCode") or "", date)
+    agg = {}
+    for code, doc_type, date in docs.values():
+        a = agg.setdefault((code, doc_type),
+                           {"last": date, "by_date": collections.Counter()})
+        a["last"] = max(a["last"], date)
+        a["by_date"][date] += 1
+    return agg
+
+
+def refresh_last_submissions(state, agg, generated_at):
+    """last_submissions を書類目録の集計で更新する (冪等)。
+
+    最終提出日は最大値で更新する。件数は、現在の最終提出日より後の
+    提出日の書類だけを加算する。初期値 (v1 索引の集計) には提出日
+    以下の書類が既に含まれているため、それ以前の書類を加算すると
+    二重数えになる。代わりに、基準日と同日の別書類は数え落とす
+    ことがある (派生属性の近似として許容し、ここに明記する)。
+    同じ集計で再実行しても結果は変わらない。マスタに無いコードの
+    書類は取り込まず、件数だけを統計として返す。
+    """
+    idx = _code_index(state)
+    rows_by_key = {(r["edinet_code"], r["doc_type"]): r
+                   for r in state["last_submissions"]}
+    stats = {"updated_rows": 0, "new_rows": 0, "added_documents": 0,
+             "unknown_codes": 0, "unknown_documents": 0}
+    for (code, doc_type), a in sorted(agg.items()):
+        code_row = idx.get(code)
+        if code_row is None:
+            stats["unknown_codes"] += 1
+            stats["unknown_documents"] += sum(a["by_date"].values())
+            continue
+        row = rows_by_key.get((code, doc_type))
+        if row is None:
+            count = sum(a["by_date"].values())
+            row = {"internal_id": code_row["internal_id"],
+                   "edinet_code": code, "doc_type": doc_type,
+                   "last_submit_date": a["last"], "document_count": count,
+                   "is_derived": True,
+                   **_provenance(CATALOG_SOURCE_KIND, CATALOG_SOURCE_ID,
+                                 generated_at)}
+            state["last_submissions"].append(row)
+            rows_by_key[(code, doc_type)] = row
+            stats["new_rows"] += 1
+            stats["added_documents"] += count
+            continue
+        baseline = row["last_submit_date"]
+        added = sum(n for d, n in a["by_date"].items() if d > baseline)
+        if added or a["last"] > baseline:
+            row["last_submit_date"] = max(baseline, a["last"])
+            row["document_count"] += added
+            row.update(_provenance(CATALOG_SOURCE_KIND, CATALOG_SOURCE_ID,
+                                   generated_at))
+            stats["updated_rows"] += 1
+            stats["added_documents"] += added
+    return stats
+
+
+_CATALOG_LEDGER_RE = re.compile(r"^catalog/month=\d{4}-\d{2}/ledger\.jsonl$")
+
+
+def download_catalog_rows(repo, work_dir):
+    """v2 の catalog/ から全月の書類目録を読み、行のリストで返す。"""
+    api = HfApi()
+    files = _with_retry("list_repo_files", lambda: api.list_repo_files(
+        repo, repo_type="dataset"))
+    rows = []
+    for path in sorted(f for f in files if _CATALOG_LEDGER_RE.match(f)):
+        local = _with_retry("hf_hub_download", lambda path=path:
+                            hf_hub_download(
+                                repo_id=repo, filename=path,
+                                repo_type="dataset",
+                                local_dir=os.path.join(work_dir, "catalog")))
+        with open(local, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    return rows
+
+
+def load_catalog_rows(catalog_dir):
+    """ローカルディレクトリの JSONL (月別の書類目録) を行で返す。"""
+    rows = []
+    for name in sorted(os.listdir(catalog_dir)):
+        if not name.endswith(".jsonl"):
+            continue
+        with open(os.path.join(catalog_dir, name), encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    return rows
 
 
 def place_history(work_dir, repo=DEFAULT_REPO, index_path=None, upload=False):
@@ -1270,8 +1391,14 @@ def run_build(work_dir, repo=DEFAULT_REPO, history_dir=None,
 
 
 def run_update(work_dir, repo=DEFAULT_REPO, state_dir=None,
-               snapshots=None, snapshots_dir=None, upload=False):
-    """日次更新: 現在の状態へ未適用のスナップショットだけを適用する。"""
+               snapshots=None, snapshots_dir=None, upload=False,
+               catalog_rows=None):
+    """日次更新: 未適用のスナップショットを適用し、最終提出日を更新する。
+
+    スナップショットの適用に加え、書類目録 (catalog/) の集計で
+    last_submissions を更新する。目録は取得経路が既に v2 へ保存した
+    ものを読むだけであり、EDINET への再取得はしない。
+    """
     generated_at = _now()
     state = read_state(state_dir) if state_dir else download_master(
         repo, work_dir)
@@ -1280,15 +1407,20 @@ def run_update(work_dir, repo=DEFAULT_REPO, state_dir=None,
         snapshots = (load_local_snapshots(snapshots_dir) if snapshots_dir
                      else download_snapshots(repo, work_dir))
     applied = apply_new_snapshots(state, snapshots, generated_at)
+    if catalog_rows is None:
+        catalog_rows = download_catalog_rows(repo, work_dir)
+    last_sub_stats = refresh_last_submissions(
+        state, aggregate_catalog_submissions(catalog_rows), generated_at)
     out_dir = os.path.join(work_dir, "master_out")
     write_state(state, out_dir)
-    summary = build_summary(state, applied)
+    summary = build_summary(
+        state, applied, {"last_submissions_refresh": last_sub_stats})
     with open(os.path.join(out_dir, "summary.json"), "w",
               encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     uploaded = upload_master(state, out_dir, repo) if upload else []
     return {"out_dir": out_dir, "uploaded": uploaded, "summary": summary,
-            "applied": applied}
+            "applied": applied, "last_submissions_refresh": last_sub_stats}
 
 
 def main(argv=None):
@@ -1305,6 +1437,8 @@ def main(argv=None):
                     help="現在の master 状態のローカルディレクトリ (update 用)")
     ap.add_argument("--snapshots-dir",
                     help="コードリスト CSV のローカルディレクトリ")
+    ap.add_argument("--catalog-dir",
+                    help="書類目録 JSONL のローカルディレクトリ (update 用)")
     ap.add_argument("--upload", action="store_true",
                     help="成果を v2 データセットへ上げる")
     args = ap.parse_args(argv)
@@ -1318,10 +1452,12 @@ def main(argv=None):
                            snapshots_dir=args.snapshots_dir,
                            upload=args.upload)
     else:
+        catalog_rows = (load_catalog_rows(args.catalog_dir)
+                        if args.catalog_dir else None)
         result = run_update(args.work_dir, repo=args.repo,
                             state_dir=args.state_dir,
                             snapshots_dir=args.snapshots_dir,
-                            upload=args.upload)
+                            upload=args.upload, catalog_rows=catalog_rows)
     print(json.dumps(result, ensure_ascii=False, default=str)[:4000])
     return 0
 

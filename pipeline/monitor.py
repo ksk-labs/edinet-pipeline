@@ -22,7 +22,9 @@
 
 監視の対象 (仕様 §5): 取得の失敗、コードリストのスナップショットの
 欠落、検証エラーの隔離件数、処理の滞留。あわせて件数を健全性の
-監視信号として日々記録する。
+監視信号として日々記録する。会社マスタ (Issue #41) は、会社数と
+最終提出日の行数を件数信号に載せ、適用済みスナップショットが
+最新のスナップショットに追いついていない場合に警報にする。
 """
 import argparse
 import json
@@ -166,6 +168,42 @@ def _judge_codelist(api, repo, remote, work_dir, ledger_rows, run_date):
     }
 
 
+def _latest_snapshot_date(remote):
+    """v2 上のコードリストのスナップショットの最新日を返す。"""
+    dates = []
+    for path in remote:
+        if path.startswith("codelist/date=") and \
+                path.endswith("/snapshot.json"):
+            dates.append(path.split("=", 1)[1].split("/", 1)[0])
+    return max(dates) if dates else None
+
+
+def _judge_company_master(summary, latest_snapshot_date):
+    """会社マスタの状態を判定する。戻り値は報告用の dict。
+
+    master/summary.json が無い場合は missing とし、警報にはしない
+    (警報の対象は仕様 §5 の取得・コードリスト・解析であり、会社
+    マスタの有無は本節と件数信号で可視化する)。summary があり、
+    適用済みスナップショットが最新のスナップショットに追いついて
+    いない場合は stale とし、日次配線の停止を警報にする。
+    """
+    if summary is None:
+        return {"status": "missing", "companies": None,
+                "last_applied_snapshot_date": None,
+                "latest_snapshot_date": latest_snapshot_date,
+                "last_submissions_rows": None}
+    applied = summary.get("last_applied_snapshot_date")
+    stale = (latest_snapshot_date is not None
+             and (applied is None or applied < latest_snapshot_date))
+    return {
+        "status": "stale" if stale else "ok",
+        "companies": summary.get("companies"),
+        "last_applied_snapshot_date": applied,
+        "latest_snapshot_date": latest_snapshot_date,
+        "last_submissions_rows": summary.get("last_submissions_rows"),
+    }
+
+
 def _judge_parse(acq_ledgers, parse_ledgers, run_date, target_date):
     """解析の状態 (当日の隔離、滞留、退避) を判定する。報告用の dict。"""
     parse_latest = {}
@@ -250,6 +288,11 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
     parse_report = _judge_parse(acq_ledgers, parse_ledgers, run_date,
                                 target_date)
 
+    master_summary = _load_json(api, repo, remote, "master/summary.json",
+                                 work_dir, "master-summary.json")
+    master_report = _judge_company_master(master_summary,
+                                          _latest_snapshot_date(remote))
+
     alerts = []
     unchecked = _unchecked_targets(prev_acq.get("last_checked_target"),
                                    target_date)
@@ -316,6 +359,18 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
                       f"{len(parse_report['retired'])} 件あります",
             "doc_ids": parse_report["retired"],
         })
+    if master_report["status"] == "stale":
+        alerts.append({
+            "kind": "company_master_stale",
+            "detail": f"会社マスタの適用済みスナップショット "
+                      f"({master_report['last_applied_snapshot_date']}) が"
+                      f"最新のスナップショット "
+                      f"({master_report['latest_snapshot_date']}) に"
+                      "追いついていません",
+            "last_applied_snapshot_date":
+                master_report["last_applied_snapshot_date"],
+            "latest_snapshot_date": master_report["latest_snapshot_date"],
+        })
 
     report = {
         "date": run_date,
@@ -330,11 +385,15 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
             "backlog_count": len(parse_report["backlog"]),
             "retired_count": len(parse_report["retired"]),
         },
+        "company_master": master_report,
         "signals": {
             "codelist_row_count": codelist_report["row_count"],
             "document_list_count": acq_report["list_count"],
             "parse_ok_today": parse_report["ok_today"],
             "parse_rows_today": parse_report["rows_today"],
+            "master_companies": master_report["companies"],
+            "master_last_submissions_rows":
+                master_report["last_submissions_rows"],
         },
         "alerts": alerts,
     }
