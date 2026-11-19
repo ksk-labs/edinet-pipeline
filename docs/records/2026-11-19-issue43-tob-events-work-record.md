@@ -157,7 +157,11 @@ Issue: ksk-labs/edinet-pipeline #43（P2-T4 の後続）。仕様: files/2026-11
   て配置される。マージ後の手順は P2-T4 と同じ: (1) ワークフロー
   を dispatch、(2) master/company_events_summary.json の件数が
   本記録の照合値（実行時点の索引による差を除く）と一致する
-  ことを確認、の順である。
+  ことを確認、の順である。なお照合値の総数（イベント
+  113,629 件・関係 17,401 組）はサマリの events_total_all／
+  relationships_total_all の値であり、従来キー events／
+  relationships は P2-T4 分（イベント 37,751 件・親子関係
+  298 組）の内訳である。
 - 本記録の照合値は、同じプログラムをローカルで実行した結果で
   ある（入力は v1 索引の固定版と、配置済みの
   master/edinet_codes.parquet。generated_at のみ実行ごとに
@@ -179,3 +183,13 @@ Issue: ksk-labs/edinet-pipeline #43（P2-T4 の後続）。仕様: files/2026-11
   報告書単位である。買付プログラム単位の集約（開始・終了の
   判定を含む）はメタデータからは決定的に行えないため行って
   いない。
+
+## code-review への対応（2026-11-19）
+
+- S-1（サマリのキー意味の明記）に対応した。サマリの従来キー
+  events／relationships が P2-T4 分の内訳であり、全系統の総数は
+  events_total_all／relationships_total_all に入ることを、
+  pipeline/company_events.py のモジュール docstring とサマリ
+  構築箇所のコメント、および本記録の「配置について」の照合
+  手順の記述へ明記した。文書のみの変更であり、コードの挙動と
+  テスト件数（全 313 件）は変わらない。

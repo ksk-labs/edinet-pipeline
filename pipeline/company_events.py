@@ -42,6 +42,10 @@ master/ への追加分 (本モジュールが正本):
 - company_relationships.parquet: 親子関係。行は (親会社, 子会社)
   単位で、初回・最終の観測日と観測回数を持つ (時点つきの記録)。
 - company_events_summary.json: 構築のサマリと照合結果。
+  キーの意味に注意: `events` と `relationships` は P2-T4 分
+  (臨時報告書のイベントと親会社等状況報告書からの親子関係)
+  の内訳であり、全系統の総数は `events_total_all` と
+  `relationships_total_all` に入る。
 
 イベント種別の決め方 (実測に基づく切り分け):
 - 取れる信号: 書類メタデータの current_report_reason (提出事由)。
@@ -826,6 +830,8 @@ def run_build(work_dir, repo=DEFAULT_REPO, index_path=None, master_dir=None,
                        e["subsidiary_edinet_code"], e["relation_kind"]))
     out_dir = os.path.join(work_dir, "master_out")
     write_outputs(events, relationships, out_dir)
+    # サマリの events／relationships は P2-T4 分の内訳であり、
+    # 全系統の総数は events_total_all／relationships_total_all。
     summary = {
         "generated_at": generated_at,
         "window_since": since,
