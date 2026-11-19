@@ -1,0 +1,123 @@
+name: taxonomy_check
+
+# P2-T9 タクソノミの継続確認と年次更新の自動化 (pipeline.taxonomy)。
+# 金融庁の一覧ページ・配布ポータル・証券コード協議会の取扱い要領・
+# arelle の EDINET プラグイン有効一覧を確認し、新版を検出したら
+# 取り込みと差分生成までを自動で行う。指標に効く要素の意味判断は
+# 自動化せず、警報 (サマリの alerts と GitHub Issue) として上げる。
+#
+# - schedule (月次確認): 毎月2日 10:00 JST。タクソノミの公表は年1回
+#   11月だが、一覧ページ・取扱い要領・arelle 一覧の変更は随時あるため
+#   月次で全経路を確認する。
+# - schedule (11月の重点確認): 11月は毎週月曜と 1日・11日・21日に追加で
+#   確認する。版の公表が11月上旬 (実績: 11月8日〜12日) のため、公表から
+#   遅くとも数日以内に検出できる密度にする。
+# - workflow_dispatch: 手動実行。mode=check は確認のみ、mode=run は
+#   確認→取込まで (通常はこちら)。
+# - arelle の追随確認のため、arelle-release を入れて同梱の有効一覧を
+#   読む (pipeline.taxonomy は同梱が無ければ上流を取得する)。
+
+on:
+  schedule:
+    - cron: "0 1 2 * *"      # 毎月2日 10:00 JST (月次確認)
+    - cron: "0 1 * 11 1"     # 11月の毎週月曜 10:00 JST (重点確認)
+    - cron: "0 1 1,11,21 11 *"  # 11月1日・11日・21日 10:00 JST (重点確認)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run (確認→取込) か check (確認のみ)"
+        default: "run"
+        type: choice
+        options: [run, check]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  taxonomy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install arelle-release
+      - name: Run taxonomy check / annual update
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODE: ${{ inputs.mode || 'run' }}
+        run: |
+          set -euo pipefail
+          python -m pipeline.taxonomy "$MODE" \
+            --work-dir work/taxonomy \
+            --indicator-elements taxonomy/indicator_elements.txt
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: taxonomy-run
+          path: |
+            work/taxonomy/out/run_summary.json
+            work/taxonomy/out/check_summary.json
+          if-no-files-found: warn
+      - name: Raise alert issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import json, os, subprocess, sys
+          path = "work/taxonomy/out/run_summary.json"
+          if not os.path.exists(path):
+              alt = "work/taxonomy/out/check_summary.json"
+              path = alt if os.path.exists(alt) else path
+          if not os.path.exists(path):
+              print("no summary; skip alert")
+              sys.exit(0)
+          with open(path, encoding="utf-8") as f:
+              summary = json.load(f)
+          alerts = []
+          if "check" in summary:
+              alerts += (summary["check"] or {}).get("alerts") or []
+              alerts += [{"kind": "failed_source", **s} for s in
+                         (summary["check"] or {}).get("failed_sources") or []]
+              alerts += (summary["ingest"] or {}).get("alerts") or []
+          else:
+              alerts += summary.get("alerts") or []
+              alerts += [{"kind": "failed_source", **s} for s in
+                         summary.get("failed_sources") or []]
+          if not alerts:
+              print("no alerts")
+              sys.exit(0)
+          title = "[taxonomy] 継続確認の警報 (P2-T9)"
+          existing = subprocess.run(
+              ["gh", "issue", "list", "--state", "open", "--search",
+               title + " in:title", "--json", "number"],
+              capture_output=True, text=True)
+          numbers = json.loads(existing.stdout or "[]")
+          if numbers:
+              # 同タイトルの Issue が開いている場合も、新しい警報を
+              # 埋もれさせないためコメントとして追記する。
+              number = numbers[0]["number"]
+              comment = ("継続確認で新たな警報が出ました。\n\n```json\n"
+                         + json.dumps(alerts, ensure_ascii=False, indent=2)
+                         + "\n```")
+              subprocess.run(["gh", "issue", "comment", str(number),
+                              "--body", comment], check=True)
+              print(f"alert appended to issue #{number}")
+              sys.exit(0)
+          body = ("pipeline.taxonomy の継続確認で警報が出ました。\n\n```json\n"
+                  + json.dumps(alerts, ensure_ascii=False, indent=2)
+                  + "\n```\n\n"
+                  "指標に効く要素の意味判断が必要な場合は、確定するまで"
+                  "旧対応で運転を継続してください (仕様 §10)。")
+          subprocess.run(["gh", "issue", "create", "--title", title,
+                          "--body", body, "--label", "ready-for-human"],
+                         check=True)
+          PY
