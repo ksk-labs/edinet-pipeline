@@ -200,6 +200,15 @@ def batched_insert_sqls(spec, rows, byte_limit=SQL_BYTE_LIMIT):
     for row in rows:
         fragment = "(" + ", ".join(
             sql_literal(row.get(c)) for c in cols) + ")"
+        # 単一行だけで上限を超える場合は、D1 へ送っても必ず失敗し
+        # その行を含むテーブル以降が毎回同じ場所で止まり続けるため、
+        # 明示的に止める (N-3)。
+        if prefix_len + len(fragment.encode("utf-8")) > byte_limit:
+            raise ValueError(
+                f"single row exceeds SQL byte limit "
+                f"({byte_limit} bytes) for table {spec['name']}: "
+                f"row is {prefix_len + len(fragment.encode('utf-8'))} "
+                f"bytes")
         frag_len = len(fragment.encode("utf-8")) + (1 if batch else 0)
         if batch and batch_len + frag_len > byte_limit:
             yield prefix + ", ".join(batch), len(batch)
@@ -534,6 +543,12 @@ def _mirror_hashes(conn, spec):
 
 
 def _mirror_upsert(conn, spec, row):
+    # 先に当該主キーの既存行を削除してから挿入する。SQLite の複合
+    # 主キーは NULL を含む行の一意性を強制しないため、INSERT OR
+    # REPLACE だけでは NULL キーの行が置換されずに旧行が残る
+    # (M-1)。削除の条件は _mirror_delete と同じ NULL 安全な形。
+    key = tuple(row.get(c) for c in spec["primary_key"])
+    _mirror_delete(conn, spec, key)
     columns = [c for c, _ in spec["columns"]]
     values = [row.get(c) for c in columns]
     values.append(row_hash(row, columns))
@@ -676,8 +691,6 @@ def run_sync(work_dir, client=None, daily_budget=DEFAULT_DAILY_BUDGET,
         conn.commit()
         if stopped:
             break
-    complete = not stopped and report["applied_ops"] == total_ops
-
     counts = {}
     mismatches = {}
     for name in TABLE_ORDER:
@@ -688,6 +701,11 @@ def run_sync(work_dir, client=None, daily_budget=DEFAULT_DAILY_BUDGET,
             f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
         if counts[name] != mirror_count:
             mismatches[name] = {"d1": counts[name], "mirror": mirror_count}
+    # 版情報は全量適用が済んだ場合のみ進める。行数に不一致がある
+    # 状態は全量適用が実測で確認できていないため complete にしない
+    # (S-1)。synced_at と table_counts の記録は残す。
+    complete = (not stopped and report["applied_ops"] == total_ops
+                and not mismatches)
     meta_values = {
         "synced_at": datetime.now(timezone.utc).isoformat(),
         "table_counts": json.dumps(counts, ensure_ascii=False),

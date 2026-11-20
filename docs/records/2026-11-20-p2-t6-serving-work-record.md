@@ -85,9 +85,13 @@ Gold と会社マスタの現行値を Cloudflare D1 に載せ、Workers API で
   停止判定には保守側の推定（主キーと明示インデックスの行数を
   行ごとに加算。events と relationships は4倍、gold 系は2倍、
   securities は3倍、companies は2倍）を使い、予算の消化は
-  各応答の meta.rows_written の実測値で累計する。推定が実測
-  より大きくても、消化は実測で進むため1日の適用総量は予算に
-  対して保守側に倒れない。初期投入の推定総量は最大で
+  各応答の meta.rows_written の実測値で累計する。停止判定は
+  推定で決まるため、推定が実測より大きい場合は保守側（安全
+  側）に倒れ、推定が小さい場合は予算超過側に倒れる。超過幅は
+  1バッチ分に限られ、上限 100,000 行に対する1割の余裕で吸収
+  する設計の範囲内である。消化の累計自体は実測値で行う（N-1
+  による訂正。旧記述「1日の適用総量は予算に対して保守側に
+  倒れない」は不正確だったため直した）。初期投入の推定総量は最大で
   1,151,413 行（予算 90,000 行/日で約13日分）。設計書の見込み
   （約50万行・約3日）との差は、D1 が主キーのインデックス行を
   rows_written に数えるかどうかに依存し、初日の実測で確定
@@ -135,18 +139,20 @@ Gold と会社マスタの現行値を Cloudflare D1 に載せ、Workers API で
 - tests/test_serving_deploy.py（7件）: metadata の構成、
   multipart の組み立て、サブドメインの取得と設定、デプロイの
   通しと失敗時の異常系。
-- workers/serving_api.test.mjs（9件）: meta の応答、companies
+- workers/serving_api.test.mjs（10件）: meta の応答、companies
   の検索条件の組み立て、404、screen の指標検証と範囲条件、
-  不正な limit の 400、GET 以外の 405、events の並び。
+  不正な limit の 400、GET 以外の 405、events の並び、q の
+  LIKE エスケープ（修正で1件追加）。
 
 ## 検証結果
 
-- テストスイート全体: 変更前 331件全件合格 → 変更後 **354件
+- テストスイート全体: 変更前 331件全件合格 → 変更後 **357件
   全件合格**（`python -m unittest discover -s tests`、CI と
-  同じコマンド）。新規は Python 23件（test_serving_sync 16件、
-  test_serving_deploy 7件）。
+  同じコマンド。2026-11-20 の修正後に実測）。新規は Python 23件（test_serving_sync 16件、
+  test_serving_deploy 7件）に加え、修正で3件（M-1・S-1・N-3
+  の回帰テスト）。
 - Worker の JS テスト: `node workers/serving_api.test.mjs` で
-  9件全件合格。`node --check workers/serving_api.js` で構文も
+  10件全件合格（2026-11-20 の修正後に実測）。`node --check workers/serving_api.js` で構文も
   確認した。tests.yml の CI は Python のみのため、JS テストは
   CI では回らない（残件に明記）。
 - 実データでの目標構築: 現行ファイルから目標状態を構築し、
@@ -163,6 +169,41 @@ Gold と会社マスタの現行値を Cloudflare D1 に載せ、Workers API で
 - 日次の駆動（Muse 側の cron）は設計 §3 の定めどおり本
   チケットの実装範囲に含めない。
 
+## 修正（2026-11-20、code-review 指摘への対応）
+
+code-review（files/2026-11-20-p2t6-code-review.md）の判定は「修
+正が必要」（must-fix 1件、should-fix 1件、note 11件）。対応は
+次のとおり。
+
+- M-1（must-fix）: `_mirror_upsert` は挿入前に当該主キーの既存
+  行を NULL 安全な条件で削除してから挿入する形に直した。
+  SQLite の複合主キーは NULL を含む行の一意性を強制しないため、
+  `INSERT OR REPLACE` だけでは NULL キーの行が置換されず旧行が
+  残留していた。修正に先立って再現テスト
+  （`test_null_key_dividend_update_propagates`）を書き、修正前
+  は `count_mismatches` が `{'gold_dividends': {'d1': 1,
+  'mirror': 2}}` になることを実測で確認してから修正し、修正後
+  は D1・ミラーとも1行で不一致なしになることを確認した。
+- S-1（should-fix）: `run_sync` の complete 判定を、行数照合
+  の後に移し、`count_mismatches` が空でない場合は complete
+  にしない形に直した。不一致の回は snapshot_date と
+  gold_generated_at を進めず、applied_snapshot_date も進め
+  ない（synced_at と table_counts の記録は残す）。回帰テスト
+  （`test_mismatch_blocks_snapshot_advance`）で、不一致時に
+  版が進まないことを確認した。修正前のコードでは同テストが
+  失敗することも確認した（突然変異）。
+- N-3: `batched_insert_sqls` は、単一行だけで 100 KB 上限を
+  超える場合に ValueError で明示的に止める形にした。テスト
+  （`test_batched_insert_sqls_rejects_oversize_single_row`）
+  を追加し、修正前のコードでは同テストが失敗することも確認
+  した。
+- N-7: `/v1/companies` の `q` は `%`・`_`・バックスラッシュを
+  エスケープし、LIKE に `ESCAPE '\'` を付けた。JS テスト
+  （`companies の q は % と _ とバックスラッシュをエスケープ
+  する`）を追加し、修正前のコードでは同テストが失敗すること
+  も確認した。
+- N-1: 方式の決定の予算管理の記述を上記のとおり訂正した。
+
 ## 注意点と残件
 
 - 未決: 初期投入の所要日数は初日の実測 rows_written で確定
@@ -174,6 +215,44 @@ Gold と会社マスタの現行値を Cloudflare D1 に載せ、Workers API で
   本記録の検証で確認済みで、同期の差分判定はミラー側の
   Python のキーで行うため同期の正確さには影響しない。将来
   Gold の生成側で重複が出ても D1 は止めない点に注意する。
+  ミラー側の NULL キー行の更新残留は M-1 の修正で解消済み
+  （修正後は delete＋insert で置換する）。
+- 予算切れで停止した回でも `_upsert_meta`（synced_at、
+  table_counts）が数行の書き込みを予算外で消費する（N-2）。
+  実害は小さいが、予算を完全に使い切った状態では上限側の余
+  裕を数行削る。現状のまま運用し、予算の消化が上限に接近す
+  る場合の見直し項目とする。
+- ミラーを作り直す場合は D1 側のテーブルも作り直す必要があ
+  る（N-4）。ミラーだけを作り直して D1 に既存行が残っている
+  状態で同期すると、初回 INSERT が主キー衝突でエラーになり
+  止まる。初期投入キャンペーンの開始前に、ミラーを作り直す
+  手順がある場合は D1 側も作り直すことを確認すること。
+- screen の指標ホワイトリスト（`workers/serving_api.js` の
+  `INDICATORS`）は登録簿 v4 の19指標をハードコードしたもの
+  で、登録簿の改版で指標が増えた場合の追随は手作業である
+  （N-5）。同期側の列追加は自動で追随するが、API 側は追随
+  漏れで新指標が screen で 400 になる。登録簿の改版時は、
+  API のホワイトリストも合わせて更新することを確認項目とす
+  る。
+- `/v1/companies` の `code` は EDINET コードと主銘柄の証券
+  コードに当てる。種類株など主銘柄以外の証券コードでは引け
+  ない（N-6）。設計の定めの範囲内だが、利用上の限界として
+  ここに記録する。
+- `pipeline/serving_deploy.py` はスクリプトの投入と workers.dev
+  サブドメインの設定までで、スクリプト側の workers.dev ルート
+  の有効化は行っていない（N-8）。初回デプロイで公開 URL が応
+  答しない場合は、この有効化が要る可能性がある。実地確認
+  （マージ後）の確認点として申し送る。
+- Worker の JS テストは CI で回らない。CI への組み込み
+  （node のセットアップを tests.yml へ足すか）は別の判断
+  事項として残す（N-9）。提供層の運用が始まる前に判断を先送
+  りしないこと。
+- 既存テーブルの主キー変更には追随しない（N-10）。`_d1_ensure_schema`
+  は `CREATE TABLE IF NOT EXISTS` と列追加のみで、主キー定義
+  の変更にはテーブルの再作成が要る。列の削除・型の変更と同種
+  の限界として位置づける。
+- `limit=0` は受け付け、空の items と total を返す（N-11）。
+  害はないため現状のままとする。
 - 登録簿の改版への追随は列の追加のみ（ALTER TABLE ADD
   COLUMN）。列の削除や型の変更には追随せず、その場合は
   テーブルの再作成が要る。

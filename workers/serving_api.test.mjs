@@ -80,6 +80,20 @@ test("companies の q は名称の部分一致として組み立てる", async (
   assert.equal(listCall.args[0], "%アルファ%");
 });
 
+test("companies の q は % と _ とバックスラッシュをエスケープする", async () => {
+  const db = makeDb(baseHandler((sql) => {
+    if (sql.includes("COUNT(*)")) return { n: 0 };
+    return [];
+  }));
+  const { status } = await callApi(
+    db, "/v1/companies?q=" + encodeURIComponent("100%_x\\y"));
+  assert.equal(status, 200);
+  const listCall = db.calls.find((c) => c.sql.includes('FROM "companies"')
+    && c.sql.includes("LIMIT"));
+  assert.ok(listCall.sql.includes("ESCAPE"));
+  assert.equal(listCall.args[0], "%100\\%\\_x\\\\y%");
+});
+
 test("companies の code は EDINET コードと証券コードの両方に当てる", async () => {
   const db = makeDb(baseHandler((sql) => {
     if (sql.includes("COUNT(*)")) return { n: 0 };

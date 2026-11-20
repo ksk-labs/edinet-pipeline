@@ -99,6 +99,12 @@ async function handleMeta(db, meta) {
   };
 }
 
+function escapeLike(value) {
+  // LIKE のワイルドカード文字 (N-7)。バックスラッシュを先に逃がす。
+  return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
+}
+
 async function handleCompanies(db, url) {
   const paging = parsePaging(url);
   if (paging === null) throw { status: 400, message: "invalid limit or offset" };
@@ -106,8 +112,8 @@ async function handleCompanies(db, url) {
   const binds = [];
   const q = url.searchParams.get("q");
   if (q) {
-    conditions.push('"name" LIKE ?');
-    binds.push(`%${q}%`);
+    conditions.push('"name" LIKE ? ESCAPE \'\\\'');
+    binds.push(`%${escapeLike(q)}%`);
   }
   const code = url.searchParams.get("code");
   if (code) {

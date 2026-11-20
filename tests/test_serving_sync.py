@@ -346,6 +346,16 @@ class DiffAndSqlTest(unittest.TestCase):
             total += count
         self.assertEqual(total, 30)
 
+    def test_batched_insert_sqls_rejects_oversize_single_row(self):
+        # N-3: 単一行だけで上限を超える場合は明示的に止める。
+        spec = {"name": "companies",
+                "columns": [("internal_id", "INTEGER"), ("name", "TEXT")],
+                "primary_key": ["internal_id"], "indexes": [],
+                "rows": [], "write_factor": 2}
+        rows = [{"internal_id": 1, "name": "あ" * 40000}]
+        with self.assertRaises(ValueError):
+            list(batched_insert_sqls(spec, rows, byte_limit=30_000))
+
 
 class BudgetLedgerTest(unittest.TestCase):
     def test_accumulates_and_persists(self):
@@ -427,6 +437,68 @@ class SyncEndToEndTest(unittest.TestCase):
         meta = {r["key"]: r["value"]
                 for r in self.fake.rows("serving_meta")}
         self.assertEqual(meta["snapshot_date"], "2026-11-20")
+
+    def test_null_key_dividend_update_propagates(self):
+        # M-1 の再現: 主キーに NULL を含む dividends 行の値の更新が、
+        # D1 へ正しく伝わり、ミラーに旧行が残留しないこと。
+        run_sync(self.work_dir, client=self.fake.client())
+        cache_dir = os.path.join(self.work_dir, "cache")
+        dividends = pq.read_table(
+            os.path.join(cache_dir, "gold_dividends.parquet"))
+        rows = dividends.to_pylist()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["securities_code"])
+        rows[0]["amount_per_share"] = 60.0
+        write_parquet(cache_dir, "gold/dividends.parquet",
+                      pa.Table.from_pylist(rows, schema=dividends.schema))
+        report = run_sync(self.work_dir, client=self.fake.client())
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["applied_ops"], 1)
+        self.assertEqual(report["count_mismatches"], {})
+        rows = self.fake.rows("gold_dividends")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["amount_per_share"], 60.0)
+        mirror = sqlite3.connect(os.path.join(self.work_dir, "mirror.sqlite"))
+        mirror_count = mirror.execute(
+            'SELECT COUNT(*) FROM "gold_dividends"').fetchone()[0]
+        mirror.close()
+        self.assertEqual(mirror_count, 1)
+
+    def test_mismatch_blocks_snapshot_advance(self):
+        # S-1 の回帰: 行数に不一致がある回は complete にせず、
+        # snapshot_date を進めないこと。
+        run_sync(self.work_dir, client=self.fake.client())
+        cache_dir = os.path.join(self.work_dir, "cache")
+        annual = pq.read_table(
+            os.path.join(cache_dir, "gold_annual.parquet"))
+        rows = annual.to_pylist()
+        rows[0]["net_sales"] = 999.0
+        write_parquet(cache_dir, "gold/annual.parquet",
+                      pa.Table.from_pylist(rows, schema=annual.schema))
+        with open(os.path.join(cache_dir, "gold_summary.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"snapshot_date": "2026-11-21",
+                       "generated_at": GEN}, f)
+        extra = dict(self.fake.rows("gold_annual")[0])
+        extra["internal_id"] = 99
+        cols = list(extra)
+        self.fake.conn.execute(
+            f'INSERT INTO "gold_annual" '
+            f'({", ".join(chr(34) + c + chr(34) for c in cols)}) '
+            f'VALUES ({", ".join("?" for _ in cols)})',
+            [extra[c] for c in cols])
+        self.fake.conn.commit()
+        report = run_sync(self.work_dir, client=self.fake.client())
+        self.assertEqual(report["status"], "partial")
+        self.assertFalse(report["complete"])
+        self.assertIn("gold_annual", report["count_mismatches"])
+        meta = {r["key"]: r["value"]
+                for r in self.fake.rows("serving_meta")}
+        self.assertEqual(meta["snapshot_date"], "2026-11-20")
+        with open(os.path.join(self.work_dir, "sync_state.json"),
+                  encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertEqual(state["applied_snapshot_date"], "2026-11-20")
 
     def test_update_and_delete_propagate(self):
         run_sync(self.work_dir, client=self.fake.client())
