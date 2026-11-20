@@ -209,7 +209,8 @@ def batched_insert_sqls(spec, rows, byte_limit=SQL_BYTE_LIMIT):
                 f"({byte_limit} bytes) for table {spec['name']}: "
                 f"row is {prefix_len + len(fragment.encode('utf-8'))} "
                 f"bytes")
-        frag_len = len(fragment.encode("utf-8")) + (1 if batch else 0)
+        # 行どうしの区切り ", " は2バイト（カンマ＋空白）。
+        frag_len = len(fragment.encode("utf-8")) + (2 if batch else 0)
         if batch and batch_len + frag_len > byte_limit:
             yield prefix + ", ".join(batch), len(batch)
             batch = []

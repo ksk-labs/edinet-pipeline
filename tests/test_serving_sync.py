@@ -346,6 +346,25 @@ class DiffAndSqlTest(unittest.TestCase):
             total += count
         self.assertEqual(total, 30)
 
+    def test_batched_insert_sqls_counts_separator_bytes(self):
+        # 区切り ", " は2バイト。1バイトとして数えると、多数の
+        # 小さい行を束ねたバッチの実長が上限を超える（2026-11-20
+        # の初回同期で companies の最初のバッチが 101,119 バイト
+        # になり D1 の SQLITE_TOOBIG で失敗した）。
+        spec = {"name": "companies",
+                "columns": [("internal_id", "INTEGER"), ("name", "TEXT")],
+                "primary_key": ["internal_id"], "indexes": [],
+                "rows": [], "write_factor": 2}
+        rows = [{"internal_id": i, "name": "x"}
+                for i in range(2000)]
+        total = 0
+        batches = list(batched_insert_sqls(spec, rows, byte_limit=10_000))
+        self.assertGreater(len(batches), 1)
+        for sql, count in batches:
+            self.assertLessEqual(len(sql.encode("utf-8")), 10_000)
+            total += count
+        self.assertEqual(total, 2000)
+
     def test_batched_insert_sqls_rejects_oversize_single_row(self):
         # N-3: 単一行だけで上限を超える場合は明示的に止める。
         spec = {"name": "companies",
