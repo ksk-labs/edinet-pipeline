@@ -19,6 +19,9 @@ v2 データセット (Yoshi-Dai/financial-lakehouse-v2) の現行ファイル
   INSERT は SQL 文の上限 (100 KB) の範囲で束ねる。各応答の
   meta.rows_written の実測値を UTC 日単位で状態ファイルへ累計し、
   1日の予算 (既定 90,000 行) を超える分は翌日へ回す。
+- D1 への呼び出しは、応答を受けた 401・429・5xx に対して最大3回
+  まで指数バックオフ付きで再試行する（2026-11-22 に 401 の間欠
+  発生を実測したため。恒常的な失敗は回数を使い切って失敗する）。
 - 資格情報は実行時に Cloudflare コネクタのヘルパー (cf_api.py) を
   import して使う。アカウント ID とデータベース UUID は引数で
   受け、コードには書かない。HTTP 層は差し替え可能で、単体テスト
@@ -61,6 +64,16 @@ INPUT_FILES = (
 )
 SQL_BYTE_LIMIT = 100_000
 DEFAULT_DAILY_BUDGET = 90_000
+# D1 呼び出しの再試行（2026-11-23 追加。2026-11-22 の 401 間欠発生への対応）。
+# 2026-11-22、401 は1日に2回、多数の成功クエリのあとに発生し、直前の
+# verify ではトークン active が確認されていた。応答を受け取ってからの
+# 401 は実行前に拒否されたもので、再送は同じ SQL を送り直すだけの安全
+# な操作である。観測: 3回の実行で2回の発生、各実行は数千回の呼び出し
+# を含むため、1呼び出しあたりの失敗確率は 10^-3 程度以下。独立なら
+# 3回連続の失敗確率は 10^-9 程度で、試行回数3回（再試行2回）で孤立した
+# 間欠失敗は拾える。恒常的な失敗は回数を使い切って失敗するため隠れない。
+MAX_QUERY_ATTEMPTS = 3
+QUERY_RETRY_BASE_DELAY_SECONDS = 2.0
 NAME_KIND = "company_name"
 DEFAULT_CF_API_PATH = ("~/workspace/custom-connectors/"
                        "custom.cloudflare/bin/cf_api.py")
@@ -436,6 +449,19 @@ class BudgetLedger:
         os.replace(tmp, self.path)
 
 
+def _is_retryable_query_status(status):
+    """D1 呼び出しの失敗のうち、再試行してよい HTTP ステータスか。
+
+    401 は通常は恒常的な認証失敗だが、この経路では 2026-11-22 に
+    間欠発生が実測されているため再試行対象にする。429 と 5xx は
+    一過性の混雑・障害の定番で再試行する。400 系のその他（SQLITE_TOOBIG
+    を含む検証エラー、403、404）は再送しても同じ結果になるため対象外。
+    ネットワーク例外（URLError 等）は応答を受け取れていないため、適用
+    済みかどうかの判定がつかず再送しない（従来どおり即失敗）。
+    """
+    return status == 401 or status == 429 or 500 <= status <= 599
+
+
 class D1Error(RuntimeError):
     pass
 
@@ -444,16 +470,42 @@ class D1Client:
     """D1 REST の query エンドポイントへの薄いラッパ。
 
     call は cf_api.call と同じ署名 (method, path, body) ->
-    (status, dict) の関数で、テストでは差し替える。
+    (status, dict) の関数で、テストでは差し替える。呼び出しは
+    _call_with_retry を通し、応答を受けた 401・429・5xx に限り
+    最大 MAX_QUERY_ATTEMPTS 回まで指数バックオフ付きで再試行する
+    （2026-11-22 の 401 間欠発生への対応）。
     """
 
-    def __init__(self, call, account_id, database_id):
+    def __init__(self, call, account_id, database_id,
+                 max_attempts=MAX_QUERY_ATTEMPTS,
+                 retry_base_delay_s=QUERY_RETRY_BASE_DELAY_SECONDS):
         self._call = call
         self._base = f"/accounts/{account_id}/d1/database/{database_id}"
+        self._max_attempts = max_attempts
+        self._retry_base_delay_s = retry_base_delay_s
+
+    def _call_with_retry(self, method, path, body=None):
+        """transport 呼び出しを、再試行対象の失敗に限り繰り返す。
+
+        成功した応答を返す。失敗した応答は、再試行対象で試行回数が
+        残っていれば指数バックオフ（初回 2秒、次に 4秒）で待って送り直し、
+        対象外か回数を使い切ったら最後の応答をそのまま返す。呼び出し側は
+        従来どおり D1Error を raise する。失敗した呼び出しに rows_written
+        は無いため、予算台帳への二重計上は起きない。
+        """
+        for attempt in range(1, self._max_attempts + 1):
+            status, resp = self._call(method, path, body)
+            if status == 200 and resp.get("success"):
+                return status, resp
+            if (_is_retryable_query_status(status)
+                    and attempt < self._max_attempts):
+                time.sleep(self._retry_base_delay_s * (2 ** (attempt - 1)))
+                continue
+            return status, resp
 
     def query(self, sql):
-        status, resp = self._call("POST", self._base + "/query",
-                                  {"sql": sql})
+        status, resp = self._call_with_retry(
+            "POST", self._base + "/query", {"sql": sql})
         if status != 200 or not resp.get("success"):
             raise D1Error(f"D1 query failed: status={status} resp={resp}")
         result = resp["result"][0]
@@ -462,7 +514,7 @@ class D1Client:
         return rows, rows_written
 
     def database_info(self):
-        status, resp = self._call("GET", self._base)
+        status, resp = self._call_with_retry("GET", self._base)
         if status != 200 or not resp.get("success"):
             raise D1Error(f"D1 database info failed: status={status}")
         return resp["result"]

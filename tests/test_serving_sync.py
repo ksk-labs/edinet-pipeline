@@ -19,7 +19,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from pipeline.serving_sync import (
-    BudgetLedger, D1Client, batched_insert_sqls, build_company_rows,
+    BudgetLedger, D1Client, D1Error, MAX_QUERY_ATTEMPTS,
+    batched_insert_sqls, build_company_rows,
     compute_diff, create_table_sql, delete_sql, derive_current_edinet_code,
     derive_current_name, derive_latest_annual, insert_sql, row_hash,
     run_sync, sqlite_type, update_sql,
@@ -390,6 +391,106 @@ class BudgetLedgerTest(unittest.TestCase):
             self.assertEqual(reloaded.state["days"], {today: 30})
 
 
+UNAUTH_401 = (401, {"success": False, "result": None,
+                     "errors": [{"code": 10000,
+                                 "message": "Authentication error"}],
+                     "messages": []})
+TOO_BIG_400 = (400, {"success": False, "result": None,
+                     "errors": [{"code": 7500,
+                                 "message": "statement too long: SQLITE_TOOBIG"}],
+                     "messages": []})
+
+
+def _ok_query(rows=None, written=0):
+    return 200, {"success": True, "result": [
+        {"success": True, "results": rows or [],
+         "meta": {"rows_written": written}}]}
+
+
+class ScriptedCall:
+    """D1Client へ渡す、応答を台本どおりに返す call。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def call(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        if self.script:
+            return self.script.pop(0)
+        return _ok_query()
+
+
+class D1ClientRetryTest(unittest.TestCase):
+    def _client(self, script):
+        call = ScriptedCall(script)
+        client = D1Client(call.call, "acct", "dbid",
+                          retry_base_delay_s=0)
+        return client, call
+
+    def test_401_then_success_retries(self):
+        # 2026-11-22 の再現: 401 のあと再試行で成功する。
+        client, call = self._client(
+            [UNAUTH_401, _ok_query([{"n": 3}])])
+        rows, written = client.query(
+            "SELECT COUNT(*) AS n FROM \"t\"")
+        self.assertEqual(rows, [{"n": 3}])
+        self.assertEqual(written, 0)
+        self.assertEqual(len(call.calls), 2)
+
+    def test_retryable_statuses_then_success(self):
+        for status in (429, 500, 502, 503):
+            client, call = self._client([
+                (status, {"success": False, "result": None,
+                          "errors": [], "messages": []}),
+                _ok_query()])
+            rows, _ = client.query("SELECT 1")
+            self.assertEqual(rows, [])
+            self.assertEqual(len(call.calls), 2)
+
+    def test_retry_exhausted_raises_after_max_attempts(self):
+        client, call = self._client([UNAUTH_401] * MAX_QUERY_ATTEMPTS)
+        with self.assertRaises(D1Error):
+            client.query("SELECT 1")
+        self.assertEqual(len(call.calls), MAX_QUERY_ATTEMPTS)
+
+    def test_400_sqlite_toobig_not_retried(self):
+        # SQLITE_TOOBIG は送り直しても同じ結果になるため即失敗。
+        client, call = self._client([TOO_BIG_400])
+        with self.assertRaises(D1Error):
+            client.query("INSERT ...")
+        self.assertEqual(len(call.calls), 1)
+
+    def test_403_not_retried(self):
+        client, call = self._client([
+            (403, {"success": False, "result": None,
+                   "errors": [{"code": 10001, "message": "Forbidden"}],
+                   "messages": []})])
+        with self.assertRaises(D1Error):
+            client.query("SELECT 1")
+        self.assertEqual(len(call.calls), 1)
+
+    def test_database_info_retries(self):
+        client, call = self._client([
+            (503, {"success": False, "result": None,
+                   "errors": [], "messages": []}),
+            (200, {"success": True, "result": {"file_size": 4242}})])
+        self.assertEqual(client.database_info(), {"file_size": 4242})
+        self.assertEqual(len(call.calls), 2)
+
+    def test_retry_delay_grows_exponentially(self):
+        scripted = ScriptedCall([
+            (500, {"success": False, "result": None,
+                   "errors": [], "messages": []})] * 3)
+        client = D1Client(scripted.call, "acct", "dbid")
+        with mock.patch("time.sleep") as sleep:
+            with self.assertRaises(D1Error):
+                client.query("SELECT 1")
+        self.assertEqual([c.args for c in sleep.call_args_list],
+                         [(2.0,), (4.0,)])
+        self.assertEqual(len(scripted.calls), 3)
+
+
 class SyncEndToEndTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -538,6 +639,39 @@ class SyncEndToEndTest(unittest.TestCase):
                if r["source_doc_id"] == "S1"][0]
         self.assertEqual(row["net_sales"], 999.0)
         self.assertEqual(len(self.fake.rows("events")), 1)
+
+    def test_transient_401_is_retried_without_double_count(self):
+        # 2026-11-22 の 401 間欠発生の再現: 最初の呼び出しだけ 401
+        # で失敗し、再試行で成功する。予算台帳は成功分の rows_written
+        # だけを累計する（二重計上なし）。
+        written = []
+
+        class FlakyFakeD1(FakeD1):
+            def __init__(self):
+                super().__init__()
+                self.failed_once = False
+
+            def call(self, method, path, body=None):
+                if not self.failed_once and method == "POST":
+                    self.failed_once = True
+                    return UNAUTH_401
+                status, resp = super().call(method, path, body)
+                if method == "POST":
+                    written.append(
+                        resp["result"][0]["meta"]["rows_written"])
+                return status, resp
+
+        flaky = FlakyFakeD1()
+        client = D1Client(flaky.call, "acct", "dbid",
+                          retry_base_delay_s=0)
+        report = run_sync(self.work_dir, client=client)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["count_mismatches"], {})
+        with open(os.path.join(self.work_dir, "sync_state.json"),
+                  encoding="utf-8") as f:
+            state = json.load(f)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.assertEqual(state["days"][today], sum(written))
 
 
 if __name__ == "__main__":
