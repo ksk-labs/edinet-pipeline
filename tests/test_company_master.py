@@ -317,6 +317,94 @@ class BuildAndUpdateTest(unittest.TestCase):
         self.assertEqual(before, after)
 
 
+class ReapplySnapshotTest(unittest.TestCase):
+    """Issue #48: 最終適用日の差し替えは再適用する。
+
+    コードリストの「正」はその日の最後に成功した取得であるため、
+    最終適用日と同じ日付で sha256 が変わっていれば再適用し、
+    sha256 が同じなら何もしない。最終適用日より前の日付の差し替え
+    は再適用しない。
+    """
+
+    def build_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_dir = os.path.join(tmp, "history")
+            build_history_dir(history_dir)
+            return state_from_history(history_dir, GEN)
+
+    def test_same_date_different_sha_reapplies(self):
+        state = self.build_state()
+        applied = apply_new_snapshots(
+            state, [(SNAP1_DATE, SNAP1, "a" * 64)], GEN)
+        self.assertEqual(len(applied), 1)
+        self.assertFalse(applied[0]["reapplied"])
+        changed = [
+            dict(r, 所在地="東京都千代田区9") if r["ＥＤＩＮＥＴコード"] == "E00001"
+            else r for r in SNAP1]
+        applied = apply_new_snapshots(
+            state, [(SNAP1_DATE, changed, "b" * 64)], GEN)
+        self.assertEqual(len(applied), 1)
+        self.assertTrue(applied[0]["reapplied"])
+        self.assertEqual(
+            state["meta"]["applied_snapshot_sha256"][SNAP1_DATE], "b" * 64)
+        rows = [a for a in state["attribute_history"]
+                if a["edinet_code"] == "E00001"
+                and a["attribute"] == "address"]
+        self.assertIn("東京都千代田区9",
+                      {r["value"] for r in rows})
+
+    def test_same_date_same_sha_is_noop(self):
+        state = self.build_state()
+        apply_new_snapshots(state, [(SNAP1_DATE, SNAP1, "a" * 64)], GEN)
+        before = (len(state["companies"]),
+                  len(state["identifier_history"]))
+        applied = apply_new_snapshots(
+            state, [(SNAP1_DATE, SNAP1, "a" * 64)], GEN)
+        self.assertEqual(applied, [])
+        after = (len(state["companies"]),
+                 len(state["identifier_history"]))
+        self.assertEqual(before, after)
+
+    def test_earlier_date_different_sha_is_skipped(self):
+        state = self.build_state()
+        apply_new_snapshots(
+            state, [(SNAP1_DATE, SNAP1, "a" * 64),
+                    (SNAP2_DATE, SNAP2, "c" * 64)], GEN)
+        changed = [
+            dict(r, 所在地="東京都千代田区8") if r["ＥＤＩＮＥＴコード"] == "E00001"
+            else r for r in SNAP1]
+        applied = apply_new_snapshots(
+            state, [(SNAP1_DATE, changed, "b" * 64)], GEN)
+        self.assertEqual(applied, [])
+        rows = [a for a in state["attribute_history"]
+                if a["edinet_code"] == "E00001"
+                and a["attribute"] == "address"]
+        self.assertNotIn("東京都千代田区8",
+                         {r["value"] for r in rows})
+
+    def test_legacy_state_without_sha_reapplies_last_date_once(self):
+        # applied_snapshot_sha256 の記録が無い既存の state では、
+        # 最終適用日を現在の sha で1回だけ再適用して記録を作る。
+        state = self.build_state()
+        apply_new_snapshots(state, [(SNAP1_DATE, SNAP1)], GEN)
+        self.assertEqual(state["meta"]["applied_snapshot_sha256"], {})
+        applied = apply_new_snapshots(
+            state, [(SNAP1_DATE, SNAP1, "a" * 64)], GEN)
+        self.assertEqual(len(applied), 1)
+        self.assertTrue(applied[0]["reapplied"])
+        applied = apply_new_snapshots(
+            state, [(SNAP1_DATE, SNAP1, "a" * 64)], GEN)
+        self.assertEqual(applied, [])
+
+    def test_summary_carries_last_applied_sha(self):
+        from pipeline.company_master import build_summary
+        state = self.build_state()
+        applied = apply_new_snapshots(
+            state, [(SNAP1_DATE, SNAP1, "a" * 64)], GEN)
+        summary = build_summary(state, applied)
+        self.assertEqual(summary["last_applied_snapshot_sha256"], "a" * 64)
+
+
 class PlaceholderAndReviewTest(unittest.TestCase):
     def test_placeholder_not_a_security(self):
         state = empty_state(GEN)

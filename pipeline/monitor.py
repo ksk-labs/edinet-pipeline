@@ -28,12 +28,24 @@
 Gold (Issue #50) は、各表の行数と会社数を件数信号に載せ、前日
 以前に Silver へ解析が追記された最新の日より Gold の生成日が
 古い場合に警報にする。
+
+締め時刻による点検日の決定 (Issue #48): GitHub Actions の実行は
+遅れることがある (実測で最大約10時間。codelist 15:15 枠が翌 01:04 JST
+実行で 9時間49分遅れ、monitor 21:30 枠が翌 06:15 JST 実行で 8時間45分
+遅れ)。定刻どおりの実行を前提に当日分を点検すると、遅れて実行された
+監視が「まだ無い」として誤警報を出す。そのため各項目は、その日の
+最終実行の定刻 + 10時間の締め時刻を過ぎた最新の日を点検する。
+点検日は実行日 (run_date) を上限とする。定常 (21:30 JST の定刻実行)
+では、取得は run_date - 2、コードリストは run_date - 1、解析は
+run_date、Gold は run_date - 1 を点検する。各日の各項目は、締めを
+過ぎた最初の監視実行でちょうど1回点検される。代償として取得・
+コードリスト・Gold の判定は定常で1日遅れる (信頼性を速度より優先)。
 """
 import argparse
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from huggingface_hub import HfApi
@@ -44,6 +56,17 @@ DEFAULT_REPO = "Yoshi-Dai/financial-lakehouse-v2"
 JST = ZoneInfo("Asia/Tokyo")
 
 STATE_PATH = "monitor/state.json"
+
+# GitHub スケジューラ遅延の実測最大 (約10時間。根拠は上記の通り)。
+SCHEDULER_DELAY_ALLOWANCE = timedelta(hours=10)
+
+# 各工程のその日の最終実行の定刻 (JST)。締め時刻は「最終実行の定刻 +
+# SCHEDULER_DELAY_ALLOWANCE」。コードリストの 23:00 は Issue #48 で
+# 追加した深夜の回である (daily_codelist.yml 参照)。
+ACQUISITION_LAST_RUN = time(15, 30)  # 取得 03:30/15:30
+CODELIST_LAST_RUN = time(23, 0)      # コードリスト 09:15/15:15/19:00/23:00
+PARSE_LAST_RUN = time(5, 30)         # 解析 05:30
+GOLD_LAST_RUN = time(20, 30)         # Gold 20:30
 
 
 def _now():
@@ -65,6 +88,40 @@ def _jst_date(iso_text):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(JST).date().isoformat()
+
+
+def _deadline(date_str, last_run):
+    """日付 date_str の工程の締め時刻 (JST) を返す。
+
+    締め時刻は、その日の最終実行の定刻 (last_run) + 遅延の実測最大
+    (SCHEDULER_DELAY_ALLOWANCE)。この時刻を過ぎれば、その日の実行は
+    遅れていても終わっているはずである。
+    """
+    day = datetime.fromisoformat(date_str).date()
+    return datetime.combine(day, last_run, tzinfo=JST) \
+        + SCHEDULER_DELAY_ALLOWANCE
+
+
+def _latest_due_date(now, last_run, upper):
+    """締め時刻を過ぎている最新の日 (YYYY-MM-DD) を返す。
+
+    now (JST) 時点で締めを過ぎている日付のうち最大のもの。upper を
+    上限とする (実行日より未来の日は点検しない)。締めを過ぎた日が
+    一つも無い場合は None (初回実行など、実用上は起きない)。
+    """
+    # 締め(D) <= now となる最大の D。D の最終実行の定刻は last_run で、
+    # 締めはその 10時間後。now から 10時間引いた時刻 t に対し、
+    # D は t の日付 (t の時刻が last_run 以降の場合) かその前日。
+    t = now - SCHEDULER_DELAY_ALLOWANCE
+    day = t.date()
+    if t.time() < last_run:
+        day -= timedelta(days=1)
+    due = day.isoformat()
+    if due > upper:
+        due = upper
+    if _deadline(due, last_run) > now:
+        return None
+    return due
 
 
 def _load_json(api, repo, remote, path_in_repo, work_dir, name):
@@ -105,7 +162,12 @@ def _acquisition_summaries(api, repo, remote, work_dir, target_date):
 
 
 def _judge_acquisition(summaries, prev_acq, target_date):
-    """取得の状態を判定する。戻り値は (報告用の dict, 状態用の dict)。"""
+    """取得の状態を判定する。戻り値は (報告用の dict, 状態用の dict)。
+
+    連続失敗は、点検対象日が前回の点検対象日より新しい場合にだけ
+    加算する。同じ対象日の再実行や、過去日への手動再実行では加算
+    しない。last_checked_target は後ろへ戻さない。
+    """
     if not summaries:
         status = "missing"
         latest = None
@@ -114,11 +176,14 @@ def _judge_acquisition(summaries, prev_acq, target_date):
         status = "failed" if (latest.get("failed") or 0) > 0 else "ok"
     consecutive = prev_acq.get("consecutive_failures") or 0
     last_ok = prev_acq.get("last_ok_date")
+    last_checked = prev_acq.get("last_checked_target")
     if status == "ok":
         consecutive = 0
         last_ok = target_date
-    elif prev_acq.get("last_checked_target") != target_date:
+    elif last_checked is None or target_date > last_checked:
         consecutive += 1
+    if last_checked is None or target_date > last_checked:
+        last_checked = target_date
     report = {
         "target_date": target_date,
         "status": status,
@@ -131,7 +196,7 @@ def _judge_acquisition(summaries, prev_acq, target_date):
     state = {
         "consecutive_failures": consecutive,
         "last_ok_date": last_ok,
-        "last_checked_target": target_date,
+        "last_checked_target": last_checked,
         "last_status": status,
     }
     return report, state
@@ -155,19 +220,28 @@ def _unchecked_targets(prev_last_checked, target_date):
     return unchecked
 
 
-def _judge_codelist(api, repo, remote, work_dir, ledger_rows, run_date):
-    """コードリストの状態を判定する。戻り値は報告用の dict。"""
+def _judge_codelist(api, repo, remote, work_dir, ledger_rows, check_date):
+    """コードリストの状態を判定する。戻り値は報告用の dict。
+
+    check_date (宣言日) のスナップショットと、その日付の目録行で
+    判定する。目録行は宣言日 (date) で結びつける (実行日 run_date
+    ではない。遅れて実行された取得は翌日の run_date を持つため)。
+    同日・異内容の差し替え (status が replaced。旧 conflict) は
+    情報として報告し、警報にはしない (Issue #48)。
+    """
     snapshot = _load_json(
-        api, repo, remote, f"codelist/date={run_date}/snapshot.json",
+        api, repo, remote, f"codelist/date={check_date}/snapshot.json",
         work_dir, "codelist-snapshot.json")
-    today_rows = [r for r in ledger_rows if r.get("run_date") == run_date]
+    today_rows = [r for r in ledger_rows if r.get("date") == check_date]
     latest = today_rows[-1] if today_rows else None
     return {
+        "date": check_date,
         "status": "ok" if snapshot is not None else "missing",
         "row_count": snapshot.get("row_count") if snapshot else None,
         "ledger_status": latest.get("status") if latest else None,
         "diff_status": latest.get("diff_status") if latest else None,
-        "conflict": any(r.get("status") == "conflict" for r in today_rows),
+        "replaced": any(r.get("status") in ("replaced", "conflict")
+                        for r in today_rows),
     }
 
 
@@ -226,16 +300,18 @@ def _latest_parse_ok_date(parse_ledgers, target_date):
     return latest
 
 
-def _judge_gold(summary, latest_parse_date):
+def _judge_gold(summary, latest_parse_date, check_date):
     """Gold の状態を判定する。戻り値は報告用の dict。
 
-    gold/summary.json が無い場合は missing とし、警報にはしない
-    (会社マスタと同じ扱い)。summary があり、前日以前に Silver へ
-    解析が追記された最新の日 (latest_parse_date) より Gold の生成日
-    (JST) が古い場合は stale とし、日次配線の停止を警報にする。
+    check_date は点検対象日。latest_parse_date は check_date 以前に
+    Silver へ解析が追記された最新の日であること (呼び出し側で
+    check_date を上限として求める)。summary が無い場合は missing と
+    し、警報にはしない (会社マスタと同じ扱い)。summary があり、
+    latest_parse_date より Gold の生成日 (JST) が古い場合は stale
+    とし、日次配線の停止を警報にする。
     """
     if summary is None:
-        return {"status": "missing", "generated_at": None,
+        return {"date": check_date, "status": "missing", "generated_at": None,
                 "generated_date": None, "snapshot_date": None,
                 "annual_rows": None, "quarterly_rows": None,
                 "dividend_rows": None, "companies": None,
@@ -245,6 +321,7 @@ def _judge_gold(summary, latest_parse_date):
              and (generated_date is None
                   or generated_date < latest_parse_date))
     return {
+        "date": check_date,
         "status": "stale" if stale else "ok",
         "generated_at": summary.get("generated_at"),
         "generated_date": generated_date,
@@ -257,15 +334,21 @@ def _judge_gold(summary, latest_parse_date):
     }
 
 
-def _judge_parse(acq_ledgers, parse_ledgers, run_date, target_date):
-    """解析の状態 (当日の隔離、滞留、退避) を判定する。報告用の dict。"""
+def _judge_parse(acq_ledgers, parse_ledgers, check_date):
+    """解析の状態 (当日の隔離、滞留、退避) を判定する。報告用の dict。
+
+    check_date は点検対象日。その日に解析された件数と、check_date の
+    前日までに取得された未解析の書類 (滞留) を数える。
+    """
+    target_date = (datetime.fromisoformat(check_date).date()
+                   - timedelta(days=1)).isoformat()
     parse_latest = {}
     parsed_today = []
     for entries in parse_ledgers.values():
         for e in entries:
             if e.get("doc_id"):
                 parse_latest[e["doc_id"]] = e
-            if _jst_date(e.get("parsed_at")) == run_date:
+            if _jst_date(e.get("parsed_at")) == check_date:
                 parsed_today.append(e)
     ok_today = [e for e in parsed_today if e.get("status") == "ok"]
     bad_today = [e for e in parsed_today
@@ -297,6 +380,7 @@ def _judge_parse(acq_ledgers, parse_ledgers, run_date, target_date):
             backlog.append(doc_id)
 
     return {
+        "date": check_date,
         "ok_today": len(ok_today),
         "rows_today": sum(e.get("rows") or 0 for e in ok_today),
         "bad_today": len(bad_today),
@@ -306,15 +390,30 @@ def _judge_parse(acq_ledgers, parse_ledgers, run_date, target_date):
     }
 
 
-def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
+def run_monitor(run_date, work_dir, repo=DEFAULT_REPO, now=None):
     """run_date (JST) の状態を点検し、日次報告と状態ファイルを保存する。
 
-    取得の点検対象は前日分 (日次取得の対象日)。コードリストは当日分。
+    各項目は、その日の最終実行の定刻 + 遅延の実測最大 (10時間) の
+    締め時刻を過ぎた最新の日を点検する (Issue #48)。点検日は
+    run_date を上限とする。取得の点検対象は前日分ではなく、締めを
+    過ぎた最新の対象日である。コードリストは点検日分。now は実行
+    時刻 (JST、既定は現在。テストで注入する)。
     戻り値は日次報告 (dict)。
     """
     os.makedirs(work_dir, exist_ok=True)
-    target_date = (datetime.fromisoformat(run_date).date()
-                   - timedelta(days=1)).isoformat()
+    now = now or datetime.now(JST)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=JST)
+    # 取得の締めは対象日の翌日 (実行日) 基準で決まるため、まず締めを
+    # 過ぎた最新の実行日を求め、対象日はその前日とする。
+    acq_run_day = _latest_due_date(now, ACQUISITION_LAST_RUN, run_date)
+    acq_target = None
+    if acq_run_day is not None:
+        acq_target = (datetime.fromisoformat(acq_run_day).date()
+                      - timedelta(days=1)).isoformat()
+    codelist_date = _latest_due_date(now, CODELIST_LAST_RUN, run_date)
+    parse_date = _latest_due_date(now, PARSE_LAST_RUN, run_date)
+    gold_date = _latest_due_date(now, GOLD_LAST_RUN, run_date)
     api = HfApi()
     remote = set(parse_mod._remote_files(api, repo))
     prev_state = _load_json(api, repo, remote, STATE_PATH, work_dir,
@@ -325,21 +424,42 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
                                            "acquisition", work_dir)
     parse_ledgers = parse_mod._fetch_ledgers(api, repo, remote,
                                              "parse", work_dir)
-    summaries = _acquisition_summaries(api, repo, remote, work_dir,
-                                       target_date)
-    acq_report, acq_state = _judge_acquisition(summaries, prev_acq,
-                                              target_date)
+    if acq_target is None:
+        acq_report = {
+            "target_date": None, "status": "pending", "runs": 0,
+            "list_count": None, "downloaded": None, "failed": None,
+            "consecutive_failures":
+                prev_acq.get("consecutive_failures") or 0,
+        }
+        acq_state = dict(prev_acq)
+        acq_state["last_status"] = "pending"
+    else:
+        summaries = _acquisition_summaries(api, repo, remote, work_dir,
+                                           acq_target)
+        acq_report, acq_state = _judge_acquisition(summaries, prev_acq,
+                                                   acq_target)
 
     codelist_rows = []
     local = os.path.join(work_dir, "dl", "codelist-ledger.jsonl")
     if "codelist/ledger.jsonl" in remote and parse_mod._download_if_exists(
             api, repo, "codelist/ledger.jsonl", local):
         codelist_rows = parse_mod._load_jsonl(local)
-    codelist_report = _judge_codelist(api, repo, remote, work_dir,
-                                      codelist_rows, run_date)
+    if codelist_date is None:
+        codelist_report = {
+            "date": None, "status": "pending", "row_count": None,
+            "ledger_status": None, "diff_status": None, "replaced": False,
+        }
+    else:
+        codelist_report = _judge_codelist(api, repo, remote, work_dir,
+                                          codelist_rows, codelist_date)
 
-    parse_report = _judge_parse(acq_ledgers, parse_ledgers, run_date,
-                                target_date)
+    if parse_date is None:
+        parse_report = {
+            "date": None, "ok_today": 0, "rows_today": 0, "bad_today": 0,
+            "bad_reasons": {}, "backlog": [], "retired": [],
+        }
+    else:
+        parse_report = _judge_parse(acq_ledgers, parse_ledgers, parse_date)
 
     master_summary = _load_json(api, repo, remote, "master/summary.json",
                                  work_dir, "master-summary.json")
@@ -348,12 +468,22 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
 
     gold_summary = _load_json(api, repo, remote, "gold/summary.json",
                               work_dir, "gold-summary.json")
-    gold_report = _judge_gold(
-        gold_summary, _latest_parse_ok_date(parse_ledgers, target_date))
+    if gold_date is None:
+        gold_report = {
+            "date": None, "status": "pending", "generated_at": None,
+            "generated_date": None, "snapshot_date": None,
+            "annual_rows": None, "quarterly_rows": None,
+            "dividend_rows": None, "companies": None,
+            "latest_parse_date": None,
+        }
+    else:
+        gold_report = _judge_gold(
+            gold_summary, _latest_parse_ok_date(parse_ledgers, gold_date),
+            gold_date)
 
     alerts = []
     unchecked = _unchecked_targets(prev_acq.get("last_checked_target"),
-                                   target_date)
+                                   acq_target) if acq_target else []
     if unchecked:
         alerts.append({
             "kind": "monitor_gap",
@@ -366,39 +496,38 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
     if acq_report["status"] == "missing":
         alerts.append({
             "kind": "acquisition_missing",
-            "detail": f"取得対象日 {target_date} の実行サマリがありません",
+            "detail": f"取得対象日 {acq_report['target_date']} の実行"
+                      "サマリがありません",
             "consecutive_failures": acq_report["consecutive_failures"],
         })
     elif acq_report["status"] == "failed":
         alerts.append({
             "kind": "acquisition_failures",
-            "detail": f"取得対象日 {target_date} の取得に "
+            "detail": f"取得対象日 {acq_report['target_date']} の取得に "
                       f"{acq_report['failed']} 件の失敗があります",
             "consecutive_failures": acq_report["consecutive_failures"],
         })
     if codelist_report["status"] == "missing":
         alerts.append({
             "kind": "codelist_missing",
-            "detail": f"{run_date} のコードリストのスナップショットが"
-                      "ありません。欠落したスナップショットは EDINET 側に"
-                      "過去分が無いため埋められません",
+            "detail": f"{codelist_report['date']} のコードリストの"
+                      "スナップショットがありません。欠落した"
+                      "スナップショットは EDINET 側に過去分が無いため"
+                      "埋められません",
         })
-    if codelist_report["conflict"]:
-        alerts.append({
-            "kind": "codelist_conflict",
-            "detail": f"{run_date} のコードリストに同日・異内容の競合が"
-                      "記録されています (先行分を保持)",
-        })
+    # codelist の同日・異内容の差し替えは警報にしない (Issue #48)。
+    # 差し替えの有無は報告の codelist.replaced に情報として残る。
     if codelist_report["diff_status"] == "pending":
         alerts.append({
             "kind": "codelist_diff_pending",
-            "detail": f"{run_date} のコードリストの差分が未生成です"
-                      " (次回の実行で補完されます)",
+            "detail": f"{codelist_report['date']} のコードリストの差分が"
+                      "未生成です (次回の実行で補完されます)",
         })
     if parse_report["bad_today"]:
         alerts.append({
             "kind": "parse_quarantined",
-            "detail": f"本日の解析で {parse_report['bad_today']} 件が"
+            "detail": f"{parse_report['date']} の解析で "
+                      f"{parse_report['bad_today']} 件が"
                       "隔離・失敗しました",
             "reasons": parse_report["bad_reasons"],
         })
@@ -447,6 +576,7 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO):
         "acquisition": acq_report,
         "codelist": codelist_report,
         "parse": {
+            "date": parse_report["date"],
             "ok_today": parse_report["ok_today"],
             "rows_today": parse_report["rows_today"],
             "bad_today": parse_report["bad_today"],

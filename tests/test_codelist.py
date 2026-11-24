@@ -295,18 +295,46 @@ class RunSnapshotTest(unittest.TestCase):
         self.assertEqual(by_code["E00002"]["change"], "removed")
         self.assertEqual(by_code["E00003"]["change"], "added")
 
-    def test_conflict_keeps_first(self):
+    def test_replaced_overwrites_with_last(self):
+        # Issue #48: 同日・異内容の取得では、その日の最後に成功した
+        # 取得を正として上書きする (従来の「先行分を保持」は廃止)。
         run_snapshot(self.work_dir("w1"), fetcher=lambda: sample_zip())
         first_csv = self.remote["codelist/date=2026-11-17/EdinetcodeDlInfo.csv"]
         other = sample_zip(rows=[make_row("E00009", name="別株式会社")])
+        other_csv = parse_codelist_zip(other)["csv_bytes"]
         summary = run_snapshot(self.work_dir("w2"), fetcher=lambda: other)
-        self.assertEqual(summary["status"], "conflict")
+        self.assertEqual(summary["status"], "replaced")
         self.assertEqual(
+            self.remote["codelist/date=2026-11-17/EdinetcodeDlInfo.csv"],
+            other_csv)
+        self.assertNotEqual(
             self.remote["codelist/date=2026-11-17/EdinetcodeDlInfo.csv"],
             first_csv)
         ledger = read_ledger(self.remote)
-        self.assertEqual(ledger[-1]["status"], "conflict")
+        self.assertEqual(ledger[-1]["status"], "replaced")
         self.assertIn("existing_sha256_csv", ledger[-1])
+        meta = json.loads(
+            self.remote["codelist/date=2026-11-17/snapshot.json"]
+            .decode("utf-8"))
+        self.assertEqual(meta["replaced_from_sha256"],
+                         ledger[-1]["existing_sha256_csv"])
+        # 差分は新しい版で再生成される。
+        diff = json.loads(self.remote["codelist/date=2026-11-17/diff.json"]
+                          .decode("utf-8"))
+        self.assertEqual(diff["added"], 1)
+        self.assertEqual(diff["current_count"], 1)
+        self.assertEqual(diff["snapshot_sha256_csv"],
+                         ledger[-1]["sha256_csv"])
+
+    def test_replaced_then_same_run_is_idempotent(self):
+        run_snapshot(self.work_dir("w1"), fetcher=lambda: sample_zip())
+        other = sample_zip(rows=[make_row("E00009", name="別株式会社")])
+        run_snapshot(self.work_dir("w2"), fetcher=lambda: other)
+        summary = run_snapshot(self.work_dir("w3"), fetcher=lambda: other)
+        self.assertEqual(summary["status"], "already_present")
+        ledger = read_ledger(self.remote)
+        self.assertEqual([r["status"] for r in ledger],
+                         ["ok", "replaced", "already_present"])
 
     def test_fetch_failure_recorded(self):
         def boom():

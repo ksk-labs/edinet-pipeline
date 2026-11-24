@@ -56,6 +56,8 @@ master/ の構成 (本モジュールが正本):
   v2 に積む catalog/) の集計で最終提出日と件数を更新する。目録は
   取得経路が既に保存したものを読むだけであり、二重取得はしない。
 - state.json: 適用済みスナップショットの最終日と次の内部 ID。
+  適用済みの各日付の sha256 (applied_snapshot_sha256) も持ち、
+  最終適用日の差し替え (Issue #48) の再適用の判定に使う。
   update の再開判定に使う。
 - summary.json: 構築・更新のサマリと照合結果。
 
@@ -387,22 +389,25 @@ def parse_codelist_csv(csv_bytes):
 
 
 def load_local_snapshots(snapshots_dir):
-    """ローカルディレクトリの CSV 群を (日付, 行) の日付昇順リストにする。"""
+    """ローカルディレクトリの CSV 群を (日付, 行, sha256) の日付昇順
+    リストにする。sha256 は CSV バイト列のものである。"""
     found = {}
     for name in sorted(os.listdir(snapshots_dir)):
         if not name.lower().endswith(".csv"):
             continue
         with open(os.path.join(snapshots_dir, name), "rb") as f:
-            date, rows = parse_codelist_csv(f.read())
+            csv_bytes = f.read()
+        date, rows = parse_codelist_csv(csv_bytes)
         if date in found:
             raise ValueError(f"同じ日付のスナップショットが複数あります: {date}")
-        found[date] = rows
-    return sorted(found.items())
+        found[date] = (rows, hashlib.sha256(csv_bytes).hexdigest())
+    return sorted((date, rows, sha) for date, (rows, sha) in found.items())
 
 
 def empty_state(generated_at):
     return {
-        "meta": {"last_applied_snapshot_date": None, "next_internal_id": 1},
+        "meta": {"last_applied_snapshot_date": None,
+                 "applied_snapshot_sha256": {}, "next_internal_id": 1},
         "companies": [], "edinet_codes": [], "identifier_history": [],
         "attribute_history": [], "securities": [], "classifications": [],
         "review_items": [], "last_submissions": [],
@@ -965,16 +970,34 @@ def _neg_date(date):
 def apply_new_snapshots(state, snapshots, generated_at):
     """未適用のスナップショットだけを日付順に適用する (冪等)。
 
-    snapshots は (日付, 行のリスト) のリスト。適用済みの日付
-    (state の meta にある最終適用日) 以前のものは読み飛ばす。
+    snapshots は (日付, 行のリスト, sha256) のリスト。適用済みの日付
+    (state の meta にある最終適用日) 以前のものは読み飛ばす。ただし
+    最終適用日と同じ日付で sha256 が変わっている場合 (Issue #48 の
+    差し替え。コードリストの「正」はその日の最後に成功した取得) は
+    その日付を再適用する。最終適用日より前の日付の差し替えは再適用
+    しない (実測上あり得ない。作業記録参照)。適用した日付の sha256
+    は meta の applied_snapshot_sha256 に記録する。既存の state に
+    その記録が無い場合、最終適用日は現在の sha で1回だけ再適用する。
+    sha256 の無い (日付, 行) の2要素の入力 (テストやローカル検証用)
+    も受け付け、その場合は従来どおり最終適用日以前を読み飛ばす。
     """
     last = state["meta"].get("last_applied_snapshot_date")
+    applied_sha = state["meta"].setdefault("applied_snapshot_sha256", {})
     applied = []
-    for date, rows in sorted(snapshots):
-        if last and date <= last:
+    for item in sorted(snapshots, key=lambda s: s[0]):
+        date, rows = item[0], item[1]
+        sha = item[2] if len(item) > 2 else None
+        if sha is not None and applied_sha.get(date) == sha:
             continue
+        if last and date < last:
+            continue
+        if sha is None and last and date <= last:
+            continue
+        reapplied = last is not None and date == last
         stats = apply_snapshot(state, rows, date, generated_at)
-        applied.append({"date": date, **stats})
+        if sha is not None:
+            applied_sha[date] = sha
+        applied.append({"date": date, "reapplied": reapplied, **stats})
         last = date
     return applied
 
@@ -1006,6 +1029,9 @@ def build_summary(state, applied, extra=None):
         "generated_at": state["generated_at"],
         "last_applied_snapshot_date": state["meta"].get(
             "last_applied_snapshot_date"),
+        "last_applied_snapshot_sha256": state["meta"].get(
+            "applied_snapshot_sha256", {}).get(
+                state["meta"].get("last_applied_snapshot_date")),
         "next_internal_id": state["meta"]["next_internal_id"],
         "companies": len(state["companies"]),
         "companies_active": sum(1 for c in state["companies"]
@@ -1233,7 +1259,8 @@ _SNAPSHOT_PATH_RE = re.compile(
 
 
 def download_snapshots(repo, work_dir):
-    """v2 の codelist/ から全スナップショットを (日付, 行) で取得する。"""
+    """v2 の codelist/ から全スナップショットを (日付, 行, sha256) で
+    取得する。sha256 は CSV バイト列のものである。"""
     api = HfApi()
     files = _with_retry("list_repo_files", lambda: api.list_repo_files(
         repo, repo_type="dataset"))
@@ -1249,12 +1276,13 @@ def download_snapshots(repo, work_dir):
                                 repo_type="dataset",
                                 local_dir=os.path.join(work_dir, "codelist")))
         with open(local, "rb") as f:
-            parsed_date, rows = parse_codelist_csv(f.read())
+            csv_bytes = f.read()
+        parsed_date, rows = parse_codelist_csv(csv_bytes)
         if parsed_date != date:
             raise ValueError(
                 f"スナップショットのパス日付 {date} と CSV の日付 "
                 f"{parsed_date} が一致しません")
-        snapshots.append((date, rows))
+        snapshots.append((date, rows, hashlib.sha256(csv_bytes).hexdigest()))
     return snapshots
 
 
