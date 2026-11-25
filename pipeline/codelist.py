@@ -6,13 +6,16 @@
 - スナップショット (codelist/date=YYYY-MM-DD/EdinetcodeDlInfo.csv):
   zip から取り出した CSV をバイト列のまま不変に保存する。日付は CSV
   の1行目にある「ダウンロード実行日」を使う (リスト自身の日付であり、
-  取得を実行した日ではない)。同じ日付のスナップショットが既にあれば
-  上書きしない (冪等)。同じ日付で内容が異なるものが既にあれば競合と
-  して記録し、先に保存されたものを正とする。
+  取得を実行した日ではない)。同じ日付のスナップショットが既にあり、
+  内容が同じなら上書きしない (冪等)。同じ日付で内容が異なるものが
+  既にあれば、その日の最後に成功した取得を正として上書きする
+  (Issue #48。従来の「先行分を保持」は廃止)。差分は新しい版で
+  再生成する。台帳には新旧の sha256 を残す。
 - 原形の二重化 (codelist/archive/Edinetcode-YYYY-MM-DD.zip): 取得した
   zip そのものも別のパスへ保存する (保存先の二重化)。抽出に問題が
   あっても原形から再抽出でき、スナップショットとは別のコミットで
-  上がるため、一方の保存が壊れても他方が残る。
+  上がるため、一方の保存が壊れても他方が残る。差し替え時は
+  スナップショットと同じく新しい版で上書きする。
 - 差分 (codelist/date=YYYY-MM-DD/diff.json と changes.jsonl): 前回
   成功したスナップショット (保存済みのうち日付が直近のもの) と
   EDINET コード単位で比較し、追加・削除・変更 (項目ごとの旧値と
@@ -22,10 +25,11 @@
   差分を未生成 (pending) として目録に残し、次回の実行が不足
   成果物の補完として生成し直す。
 - 目録 (codelist/ledger.jsonl): 実行ごとの結果 (ok・already_present・
-  conflict・failed) を追記する。スナップショットの成果物を上げて
-  から目録を上げるので、目録が ok を主張して実体が無い状態には
-  ならない。取得や検証の失敗は全体を止めず、理由つきで目録へ
-  記録して次回の試行で再取得する。
+  replaced・failed) を追記する。replaced は同日・異内容の取得で
+  スナップショットを新しい版で上書きした実行である (旧 conflict)。
+  スナップショットの成果物を上げてから目録を上げるので、目録が ok
+  を主張して実体が無い状態にはならない。取得や検証の失敗は全体を
+  止めず、理由つきで目録へ記録して次回の試行で再取得する。
 
 CSV の形式 (一次情報で確定。files/2026-11-17-primary-source-checks.md):
 カンマ区切り、文字コードは Shift_JIS 系、1行目はダウンロード実行日と
@@ -430,7 +434,7 @@ def run_snapshot(work_dir, repo=DEFAULT_REPO, fetcher=None):
 
 
 def _complete_diff(api, repo, work_dir, snap, summary, paths, remote,
-                   fetched_at):
+                   fetched_at, force=False):
     """差分 (diff.json と changes.jsonl) を生成して保存する。
 
     スナップショット本体とは独立した従属工程として扱い、基準の取得や
@@ -440,13 +444,38 @@ def _complete_diff(api, repo, work_dir, snap, summary, paths, remote,
     する) のいずれか。generated のときは base_date と added /
     removed / changed を、pending のときは error を持つ。保存した
     パスは completed に入れ、summary["uploaded"] へも追記する。
+
+    diff.json には対象スナップショットの sha256 (snapshot_sha256_csv)
+    を記録する。既存の差分があっても、その sha が現在のスナップ
+    ショットと異なれば再生成する (差し替え時に差分の再生成が失敗
+    して古い差分が残った場合の補完)。force が真の場合は、既存の
+    有無にかかわらず再生成して上書きする (差し替え時の再生成用)。
+    再生成した差分は、既存の差分が古い版だった場合 (stale) も含めて
+    上書きする。再生成して status を generated としながら古い差分を
+    残すことはしない (M-1)。既存の差分が読めない場合も sha を検証
+    できないため同じ扱いとする (内容が同じなら再送は冪等である)。
     """
     date = snap["declared_date"]
     stage_dir = os.path.join(work_dir, "stage")
     result = {"status": "present", "base_date": None, "added": None,
               "removed": None, "changed": None, "completed": []}
-    if paths["diff"] in remote and paths["changes"] in remote:
-        return result
+    stale = False
+    if not force and paths["diff"] in remote:
+        existing = os.path.join(stage_dir, "existing-diff.json")
+        if _download_if_exists(api, repo, paths["diff"], existing):
+            try:
+                with open(existing, encoding="utf-8") as f:
+                    old_diff = json.load(f)
+                if old_diff.get("snapshot_sha256_csv") \
+                        == summary["sha256_csv"]:
+                    if paths["changes"] in remote:
+                        return result
+                else:
+                    stale = True
+            except (ValueError, OSError):
+                stale = True
+        else:
+            stale = True
     try:
         base_date, base_by_code = _previous_snapshot(
             api, repo, remote, date, work_dir)
@@ -454,6 +483,7 @@ def _complete_diff(api, repo, work_dir, snap, summary, paths, remote,
                                                snap["by_code"])
         diff = {
             "date": date, "base_date": base_date, "generated_at": _now(),
+            "snapshot_sha256_csv": summary["sha256_csv"],
             "previous_count": len(base_by_code) if base_date else None,
             "current_count": len(snap["rows"]),
             "added": len(added), "removed": len(removed),
@@ -472,7 +502,7 @@ def _complete_diff(api, repo, work_dir, snap, summary, paths, remote,
              f"codelist {date}: diff changes"),
         ]
         for repo_path, data, message in products:
-            if repo_path in remote:
+            if repo_path in remote and not (force or stale):
                 continue
             local = os.path.join(stage_dir, repo_path)
             _write_local(local, data)
@@ -499,30 +529,29 @@ def _save_snapshot(api, repo, work_dir, snap, zip_bytes, summary, paths,
     最上位とし、差分は本体に依存しない従属工程とする。基準スナップ
     ショットの取得に失敗しても本体の保存は成功として記録し、差分は
     未生成 (pending) として目録に残す。
+
+    同じ日付で内容が異なるスナップショットが既にある場合、その日の
+    最後に成功した取得を正として上書きする (Issue #48)。上書きした
+    場合は status を "replaced" とし、差分を新しい版で再生成する。
     """
     date = snap["declared_date"]
     stage_dir = os.path.join(work_dir, "stage")
     state_dir = os.path.join(work_dir, "state")
     remote = _remote_files(api, repo)
 
+    replace = False
+    existing_sha = None
     if paths["csv"] in remote:
         local_existing = os.path.join(state_dir, f"existing-{date}.csv")
         _download_if_exists(api, repo, paths["csv"], local_existing)
         with open(local_existing, "rb") as f:
             existing_sha = sha256_bytes(f.read())
         if existing_sha != summary["sha256_csv"]:
-            summary["status"] = "conflict"
+            replace = True
             summary["existing_sha256_csv"] = existing_sha
-            return _finish_run(api, repo, work_dir, summary, {
-                "date": date, "run_date": run_date, "status": "conflict",
-                "fetched_at": fetched_at,
-                "sha256_csv": summary["sha256_csv"],
-                "existing_sha256_csv": existing_sha,
-                "row_count": summary["row_count"],
-                "source": SOURCE_KIND, "source_id": SOURCE_ID,
-                "redistribution": REDISTRIBUTION,
-            })
-        status = "already_present"
+            status = "replaced"
+        else:
+            status = "already_present"
     else:
         status = "ok"
 
@@ -538,6 +567,8 @@ def _save_snapshot(api, repo, work_dir, snap, zip_bytes, summary, paths,
         "source": SOURCE_KIND, "source_id": SOURCE_ID,
         "fetched_at": fetched_at, "redistribution": REDISTRIBUTION,
     }
+    if replace:
+        meta["replaced_from_sha256"] = existing_sha
     body_products = [
         (paths["archive"], zip_bytes,
          f"codelist {date}: original zip (archive)"),
@@ -548,7 +579,7 @@ def _save_snapshot(api, repo, work_dir, snap, zip_bytes, summary, paths,
     ]
     completed = []
     for repo_path, data, message in body_products:
-        if repo_path in remote:
+        if repo_path in remote and not replace:
             continue
         local = os.path.join(stage_dir, repo_path)
         _write_local(local, data)
@@ -557,7 +588,7 @@ def _save_snapshot(api, repo, work_dir, snap, zip_bytes, summary, paths,
         completed.append(repo_path)
 
     diff = _complete_diff(api, repo, work_dir, snap, summary, paths,
-                          remote, fetched_at)
+                          remote, fetched_at, force=replace)
     completed.extend(diff["completed"])
     summary["diff_status"] = diff["status"]
     summary["diff_base_date"] = diff["base_date"]
@@ -581,6 +612,8 @@ def _save_snapshot(api, repo, work_dir, snap, zip_bytes, summary, paths,
         "source": SOURCE_KIND, "source_id": SOURCE_ID,
         "redistribution": REDISTRIBUTION,
     }
+    if replace:
+        row["existing_sha256_csv"] = existing_sha
     if diff["status"] == "pending":
         row["diff_error"] = diff["error"]
     return _finish_run(api, repo, work_dir, summary, row)

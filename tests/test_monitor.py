@@ -3,6 +3,12 @@
 合格条件6の故障ケースを含む: 取得の失敗を人為的に起こした状態
 (実行サマリが無い、失敗件数がある) で、警報が日次報告と状態ファイルに
 載り、連続失敗が明示されることを確認する。
+
+Issue #48: 各項目の点検日は締め時刻 (その日の最終実行の定刻 +
+遅延の実測最大 10時間) を過ぎた最新の日である。テストの既定の実行
+時刻は 21:30 JST (定刻実行) で、このときの点検日は取得が run_date - 2、
+コードリストが run_date - 1、解析が run_date、Gold が run_date - 1
+である。fixture は点検日に合わせて置くこと。
 """
 import json
 import os
@@ -10,6 +16,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime, time, timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -67,11 +74,22 @@ class MonitorTestBase(unittest.TestCase):
     def put(self, path, data):
         self.store[path] = data
 
-    def run_monitor(self, run_date):
+    def run_monitor(self, run_date, now=None):
+        """run_date の監視を実行する。now が無ければ 21:30 JST
+        (定刻実行) とする。"""
         self.work_seq += 1
+        if now is None:
+            day = datetime.fromisoformat(run_date).date()
+            now = datetime.combine(day, time(21, 30), tzinfo=monitor.JST)
         return monitor.run_monitor(
             run_date, os.path.join(self.tmp, f"work-{self.work_seq}"),
-            repo="fake/repo")
+            repo="fake/repo", now=now)
+
+    def at(self, run_date, hour, minute):
+        """run_date の指定時刻 (JST) を返す。"""
+        day = datetime.fromisoformat(run_date).date()
+        return datetime.combine(day, time(hour, minute),
+                                tzinfo=monitor.JST)
 
     def saved_report(self, run_date):
         data = self.store[f"monitor/reports/date={run_date}/report.json"]
@@ -93,9 +111,12 @@ class MonitorTestBase(unittest.TestCase):
                 "finished_at": f"{target_date}T19:00:00+00:00",
             }))
 
-    def put_codelist_ok(self, run_date, row_count=11468):
-        self.put(f"codelist/date={run_date}/snapshot.json", _json_bytes({
-            "date": run_date, "row_count": row_count}))
+    def put_codelist_ok(self, run_date, row_count=11468, sha256_csv=None):
+        snapshot = {"date": run_date, "row_count": row_count}
+        if sha256_csv is not None:
+            snapshot["sha256_csv"] = sha256_csv
+        self.put(f"codelist/date={run_date}/snapshot.json",
+                 _json_bytes(snapshot))
         self.put("codelist/ledger.jsonl", _jsonl_bytes([
             {"date": run_date, "run_date": run_date, "status": "ok",
              "diff_status": "generated", "row_count": row_count},
@@ -104,19 +125,23 @@ class MonitorTestBase(unittest.TestCase):
 
 class HealthyDayTest(MonitorTestBase):
     def test_no_alerts_and_state_saved(self):
-        self.put_acquisition_ok("2026-11-16")
-        self.put_codelist_ok("2026-11-17")
+        # 定刻実行 (21:30) では取得は run_date - 2、コードリストは
+        # run_date - 1 を点検する。
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
         report = self.run_monitor("2026-11-17")
         self.assertEqual(report["alerts"], [])
         self.assertEqual(report["acquisition"]["status"], "ok")
+        self.assertEqual(report["acquisition"]["target_date"], "2026-11-15")
         self.assertEqual(report["acquisition"]["consecutive_failures"], 0)
+        self.assertEqual(report["codelist"]["date"], "2026-11-16")
         self.assertEqual(report["signals"]["codelist_row_count"], 11468)
         self.assertEqual(report["signals"]["document_list_count"], 100)
         saved = self.saved_report("2026-11-17")
         self.assertEqual(saved["alerts"], [])
         state = self.saved_state()
         self.assertEqual(state["acquisition"]["consecutive_failures"], 0)
-        self.assertEqual(state["acquisition"]["last_ok_date"], "2026-11-16")
+        self.assertEqual(state["acquisition"]["last_ok_date"], "2026-11-15")
         self.assertEqual(state["open_alerts"], [])
 
 
@@ -124,7 +149,7 @@ class AcquisitionFailureTest(MonitorTestBase):
     """合格条件6: 取得の失敗で警報が載り、連続失敗が明示される。"""
 
     def test_missing_run_alerts_and_counts_consecutive_days(self):
-        self.put_codelist_ok("2026-11-17")
+        self.put_codelist_ok("2026-11-16")
         report = self.run_monitor("2026-11-17")
         kinds = [a["kind"] for a in report["alerts"]]
         self.assertIn("acquisition_missing", kinds)
@@ -132,7 +157,7 @@ class AcquisitionFailureTest(MonitorTestBase):
         self.assertEqual(self.saved_state()["acquisition"]
                          ["consecutive_failures"], 1)
 
-        self.put_codelist_ok("2026-11-18")
+        self.put_codelist_ok("2026-11-17")
         report = self.run_monitor("2026-11-18")
         self.assertEqual(report["acquisition"]["consecutive_failures"], 2)
         alert = next(a for a in report["alerts"]
@@ -142,24 +167,36 @@ class AcquisitionFailureTest(MonitorTestBase):
                          ["acquisition"]["consecutive_failures"], 2)
 
     def test_failed_documents_count_as_failure_then_recovery(self):
-        self.put_codelist_ok("2026-11-17")
-        self.put_acquisition_ok("2026-11-16", failed=3)
+        self.put_codelist_ok("2026-11-16")
+        self.put_acquisition_ok("2026-11-15", failed=3)
         report = self.run_monitor("2026-11-17")
         kinds = [a["kind"] for a in report["alerts"]]
         self.assertIn("acquisition_failures", kinds)
         self.assertEqual(report["acquisition"]["consecutive_failures"], 1)
 
-        self.put_codelist_ok("2026-11-18")
-        self.put_acquisition_ok("2026-11-17")
+        self.put_codelist_ok("2026-11-17")
+        self.put_acquisition_ok("2026-11-16")
         report = self.run_monitor("2026-11-18")
         self.assertEqual(report["acquisition"]["status"], "ok")
         self.assertEqual(report["acquisition"]["consecutive_failures"], 0)
 
     def test_same_target_rerun_does_not_double_count(self):
-        self.put_codelist_ok("2026-11-17")
+        self.put_codelist_ok("2026-11-16")
         self.run_monitor("2026-11-17")
         report = self.run_monitor("2026-11-17")
         self.assertEqual(report["acquisition"]["consecutive_failures"], 1)
+
+    def test_older_target_rerun_does_not_move_state_back(self):
+        # 過去日への手動再実行では、連続失敗も点検対象日も後ろへ
+        # 戻さない (Issue #48)。
+        self.put_codelist_ok("2026-11-16")
+        self.run_monitor("2026-11-17")
+        self.assertEqual(self.saved_state()["acquisition"]
+                         ["last_checked_target"], "2026-11-15")
+        report = self.run_monitor("2026-11-16")
+        self.assertEqual(report["acquisition"]["consecutive_failures"], 1)
+        self.assertEqual(self.saved_state()["acquisition"]
+                         ["last_checked_target"], "2026-11-15")
 
 
 class LatestSummarySelectionTest(MonitorTestBase):
@@ -168,20 +205,20 @@ class LatestSummarySelectionTest(MonitorTestBase):
     取得は1日2回 (03:30 と 15:30) の schedule であり、15:30 の回復実行
     が 03:30 の失敗を上書きすること (およびその逆) が毎日の運転の前提
     であるため、サマリの選択をテストで固定する。ファイル名の stamp は
-    実行開始時刻 (UTC) で、03:30 JST の実行が 20261116T183000Z、
-    15:30 JST の実行が 20261117T063000Z に対応する。
+    実行開始時刻 (UTC) で、対象日 11-15 の 03:30 JST の実行が
+    20261115T183000Z、15:30 JST の実行が 20261116T063000Z に対応する。
     """
 
     def test_later_ok_overrides_earlier_failure_and_resets_streak(self):
-        self.put_codelist_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-15")
         report = self.run_monitor("2026-11-16")
         self.assertEqual(report["acquisition"]["consecutive_failures"], 1)
 
-        self.put_codelist_ok("2026-11-17")
-        self.put_acquisition_ok("2026-11-16", failed=3,
-                                stamp="20261116T183000Z", list_count=90)
-        self.put_acquisition_ok("2026-11-16", failed=0,
-                                stamp="20261117T063000Z", list_count=100)
+        self.put_codelist_ok("2026-11-16")
+        self.put_acquisition_ok("2026-11-15", failed=3,
+                                stamp="20261115T183000Z", list_count=90)
+        self.put_acquisition_ok("2026-11-15", failed=0,
+                                stamp="20261116T063000Z", list_count=100)
         report = self.run_monitor("2026-11-17")
         acq = report["acquisition"]
         self.assertEqual(acq["runs"], 2)
@@ -192,14 +229,14 @@ class LatestSummarySelectionTest(MonitorTestBase):
         kinds = [a["kind"] for a in report["alerts"]]
         self.assertNotIn("acquisition_failures", kinds)
         state = self.saved_state()
-        self.assertEqual(state["acquisition"]["last_ok_date"], "2026-11-16")
+        self.assertEqual(state["acquisition"]["last_ok_date"], "2026-11-15")
 
     def test_later_failure_overrides_earlier_ok(self):
-        self.put_codelist_ok("2026-11-17")
-        self.put_acquisition_ok("2026-11-16", failed=0,
-                                stamp="20261116T183000Z", list_count=90)
-        self.put_acquisition_ok("2026-11-16", failed=2,
-                                stamp="20261117T063000Z", list_count=100)
+        self.put_codelist_ok("2026-11-16")
+        self.put_acquisition_ok("2026-11-15", failed=0,
+                                stamp="20261115T183000Z", list_count=90)
+        self.put_acquisition_ok("2026-11-15", failed=2,
+                                stamp="20261116T063000Z", list_count=100)
         report = self.run_monitor("2026-11-17")
         acq = report["acquisition"]
         self.assertEqual(acq["runs"], 2)
@@ -220,20 +257,25 @@ class MonitorGapTest(MonitorTestBase):
     """
 
     def put_healthy(self, run_date, target_date):
+        # 定刻実行 (21:30) では取得は run_date - 2、コードリストは
+        # run_date - 1 を点検するため、コードリストは実行日の前日分を
+        # 置く。
         self.put_acquisition_ok(target_date)
-        self.put_codelist_ok(run_date)
+        day = datetime.fromisoformat(run_date).date()
+        self.put_codelist_ok(
+            (day - timedelta(days=1)).isoformat())
 
     def test_skipped_days_alert_as_monitor_gap(self):
-        self.put_healthy("2026-11-17", "2026-11-16")
+        self.put_healthy("2026-11-17", "2026-11-15")
         self.run_monitor("2026-11-17")
 
-        self.put_healthy("2026-11-20", "2026-11-19")
+        self.put_healthy("2026-11-20", "2026-11-18")
         report = self.run_monitor("2026-11-20")
         kinds = [a["kind"] for a in report["alerts"]]
         self.assertEqual(kinds, ["monitor_gap"])
         alert = report["alerts"][0]
         self.assertEqual(alert["unchecked_targets"],
-                         ["2026-11-17", "2026-11-18"])
+                         ["2026-11-16", "2026-11-17"])
         self.assertIn("monitor_gap", self.saved_state()["open_alerts"])
         self.assertIn("monitor_gap",
                       [a["kind"] for a in
@@ -241,9 +283,9 @@ class MonitorGapTest(MonitorTestBase):
 
     def test_consecutive_days_have_no_gap(self):
         for run_date, target_date in [
-                ("2026-11-17", "2026-11-16"),
-                ("2026-11-18", "2026-11-17"),
-                ("2026-11-19", "2026-11-18")]:
+                ("2026-11-17", "2026-11-15"),
+                ("2026-11-18", "2026-11-16"),
+                ("2026-11-19", "2026-11-17")]:
             self.put_healthy(run_date, target_date)
             report = self.run_monitor(run_date)
             kinds = [a["kind"] for a in report["alerts"]]
@@ -251,7 +293,7 @@ class MonitorGapTest(MonitorTestBase):
         self.assertEqual(report["alerts"], [])
 
     def test_same_day_rerun_has_no_gap(self):
-        self.put_healthy("2026-11-17", "2026-11-16")
+        self.put_healthy("2026-11-17", "2026-11-15")
         self.run_monitor("2026-11-17")
         report = self.run_monitor("2026-11-17")
         kinds = [a["kind"] for a in report["alerts"]]
@@ -260,32 +302,66 @@ class MonitorGapTest(MonitorTestBase):
 
 class CodelistMissingTest(MonitorTestBase):
     def test_missing_snapshot_alerts(self):
-        self.put_acquisition_ok("2026-11-16")
+        self.put_acquisition_ok("2026-11-15")
         report = self.run_monitor("2026-11-17")
         kinds = [a["kind"] for a in report["alerts"]]
         self.assertIn("codelist_missing", kinds)
         self.assertEqual(report["codelist"]["status"], "missing")
+        self.assertEqual(report["codelist"]["date"], "2026-11-16")
         self.assertIsNone(report["signals"]["codelist_row_count"])
 
-    def test_conflict_and_pending_diff_alert(self):
-        self.put_acquisition_ok("2026-11-16")
-        self.put("codelist/date=2026-11-17/snapshot.json",
-                 _json_bytes({"date": "2026-11-17", "row_count": 11468}))
+    def test_replaced_snapshot_is_recorded_not_alerted(self):
+        # Issue #48: 同日差し替え (replaced) は情報として記録し、
+        # codelist_conflict の警報は出さない。
+        self.put_acquisition_ok("2026-11-15")
+        self.put("codelist/date=2026-11-16/snapshot.json",
+                 _json_bytes({"date": "2026-11-16", "row_count": 11468}))
         self.put("codelist/ledger.jsonl", _jsonl_bytes([
-            {"date": "2026-11-17", "run_date": "2026-11-17",
-             "status": "conflict", "diff_status": "pending"},
+            {"date": "2026-11-16", "run_date": "2026-11-16",
+             "status": "ok", "diff_status": "generated"},
+            {"date": "2026-11-16", "run_date": "2026-11-17",
+             "status": "replaced", "diff_status": "generated",
+             "existing_sha256_csv": "aaa", "sha256_csv": "bbb"},
         ]))
         report = self.run_monitor("2026-11-17")
         kinds = [a["kind"] for a in report["alerts"]]
-        self.assertIn("codelist_conflict", kinds)
+        self.assertNotIn("codelist_conflict", kinds)
+        self.assertTrue(report["codelist"]["replaced"])
+        self.assertEqual(report["codelist"]["status"], "ok")
+
+    def test_legacy_conflict_row_is_recorded_not_alerted(self):
+        # 旧版の台帳の conflict 行も、警報ではなく記録として扱う。
+        self.put_acquisition_ok("2026-11-15")
+        self.put("codelist/date=2026-11-16/snapshot.json",
+                 _json_bytes({"date": "2026-11-16", "row_count": 11468}))
+        self.put("codelist/ledger.jsonl", _jsonl_bytes([
+            {"date": "2026-11-16", "run_date": "2026-11-16",
+             "status": "conflict", "diff_status": "generated"},
+        ]))
+        report = self.run_monitor("2026-11-17")
+        kinds = [a["kind"] for a in report["alerts"]]
+        self.assertNotIn("codelist_conflict", kinds)
+        self.assertTrue(report["codelist"]["replaced"])
+
+    def test_pending_diff_still_alerts(self):
+        self.put_acquisition_ok("2026-11-15")
+        self.put("codelist/date=2026-11-16/snapshot.json",
+                 _json_bytes({"date": "2026-11-16", "row_count": 11468}))
+        self.put("codelist/ledger.jsonl", _jsonl_bytes([
+            {"date": "2026-11-16", "run_date": "2026-11-16",
+             "status": "ok", "diff_status": "pending"},
+        ]))
+        report = self.run_monitor("2026-11-17")
+        kinds = [a["kind"] for a in report["alerts"]]
         self.assertIn("codelist_diff_pending", kinds)
+        self.assertNotIn("codelist_conflict", kinds)
 
 
 class ParseIssuesTest(MonitorTestBase):
     def setUp(self):
         super().setUp()
-        self.put_acquisition_ok("2026-11-16")
-        self.put_codelist_ok("2026-11-17")
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
 
     def test_quarantine_backlog_and_retired_alert(self):
         self.put("acquisition/month=2026-11/ledger.jsonl", _jsonl_bytes([
@@ -328,14 +404,19 @@ class ParseIssuesTest(MonitorTestBase):
 class CompanyMasterMonitorTest(MonitorTestBase):
     """Issue #41: 会社マスタの件数信号と、未適用の警報。"""
 
-    def put_master(self, applied, companies=11823, last_sub_rows=50000):
-        self.put("master/summary.json", _json_bytes({
+    def put_master(self, applied, companies=11823, last_sub_rows=50000,
+                   applied_sha=None):
+        summary = {
             "last_applied_snapshot_date": applied,
             "companies": companies,
-            "last_submissions_rows": last_sub_rows}))
+            "last_submissions_rows": last_sub_rows}
+        if applied_sha is not None:
+            summary["last_applied_snapshot_sha256"] = applied_sha
+        self.put("master/summary.json", _json_bytes(summary))
 
     def test_current_master_is_ok_and_signals_present(self):
-        self.put_acquisition_ok("2026-11-16")
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
         self.put_codelist_ok("2026-11-17")
         self.put_master("2026-11-17")
         report = self.run_monitor("2026-11-17")
@@ -347,7 +428,8 @@ class CompanyMasterMonitorTest(MonitorTestBase):
         self.assertEqual(report["alerts"], [])
 
     def test_stale_master_alerts(self):
-        self.put_acquisition_ok("2026-11-16")
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
         self.put_codelist_ok("2026-11-17")
         self.put_master("2026-11-16")
         report = self.run_monitor("2026-11-17")
@@ -361,13 +443,50 @@ class CompanyMasterMonitorTest(MonitorTestBase):
                       self.saved_state()["open_alerts"])
 
     def test_missing_master_is_reported_without_alert(self):
-        self.put_acquisition_ok("2026-11-16")
-        self.put_codelist_ok("2026-11-17")
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
         report = self.run_monitor("2026-11-17")
         self.assertEqual(report["company_master"]["status"], "missing")
         self.assertIsNone(report["signals"]["master_companies"])
         self.assertIsNone(
             report["signals"]["master_last_submissions_rows"])
+        self.assertEqual(report["alerts"], [])
+
+    def test_same_date_different_sha_is_stale(self):
+        # S-1: 同日差し替え後に master update が失敗した場合、日付は
+        # 同じままになるため、sha の比較で stale とする。
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17", sha256_csv="bbb")
+        self.put_master("2026-11-17", applied_sha="aaa")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["company_master"]["status"], "stale")
+        kinds = [a["kind"] for a in report["alerts"]]
+        self.assertEqual(kinds, ["company_master_stale"])
+        alert = report["alerts"][0]
+        self.assertEqual(alert["last_applied_snapshot_sha256"], "aaa")
+        self.assertEqual(alert["latest_snapshot_sha256"], "bbb")
+        self.assertIn("company_master_stale",
+                      self.saved_state()["open_alerts"])
+
+    def test_same_date_same_sha_is_ok(self):
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17", sha256_csv="bbb")
+        self.put_master("2026-11-17", applied_sha="bbb")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["company_master"]["status"], "ok")
+        self.assertEqual(report["alerts"], [])
+
+    def test_same_date_missing_sha_falls_back_to_date(self):
+        # 移行前の summary (sha 無し) では日付だけの比較に落とし、
+        # 誤った stale を出さない。
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17", sha256_csv="bbb")
+        self.put_master("2026-11-17")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["company_master"]["status"], "ok")
         self.assertEqual(report["alerts"], [])
 
 
@@ -388,8 +507,8 @@ class GoldMonitorTest(MonitorTestBase):
              "parsed_at": parsed_at, "month": "2026-11"}]))
 
     def test_current_gold_is_ok_and_signals_present(self):
-        self.put_acquisition_ok("2026-11-16")
-        self.put_codelist_ok("2026-11-17")
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
         self.put_parse_ok("2026-11-16T10:00:00+00:00")
         self.put_gold("2026-11-16T12:00:00+00:00")
         report = self.run_monitor("2026-11-17")
@@ -402,8 +521,8 @@ class GoldMonitorTest(MonitorTestBase):
         self.assertEqual(report["alerts"], [])
 
     def test_stale_gold_alerts(self):
-        self.put_acquisition_ok("2026-11-16")
-        self.put_codelist_ok("2026-11-17")
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
         self.put_parse_ok("2026-11-16T10:00:00+00:00")
         self.put_gold("2026-11-15T12:00:00+00:00")
         report = self.run_monitor("2026-11-17")
@@ -415,8 +534,8 @@ class GoldMonitorTest(MonitorTestBase):
         self.assertIn("gold_stale", self.saved_state()["open_alerts"])
 
     def test_missing_gold_is_reported_without_alert(self):
-        self.put_acquisition_ok("2026-11-16")
-        self.put_codelist_ok("2026-11-17")
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
         self.put_parse_ok("2026-11-16T10:00:00+00:00")
         report = self.run_monitor("2026-11-17")
         self.assertEqual(report["gold"]["status"], "missing")
@@ -425,8 +544,8 @@ class GoldMonitorTest(MonitorTestBase):
         self.assertEqual(report["alerts"], [])
 
     def test_same_day_parse_does_not_make_gold_stale(self):
-        self.put_acquisition_ok("2026-11-16")
-        self.put_codelist_ok("2026-11-17")
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
         # 当日 (run_date) の解析は、その日の解析 run の後段で Gold が
         # 更新される途中でありうるため、前日以前の生成でも警報にしない
         self.put_parse_ok("2026-11-17T01:00:00+00:00")
@@ -434,6 +553,87 @@ class GoldMonitorTest(MonitorTestBase):
         report = self.run_monitor("2026-11-17")
         self.assertEqual(report["gold"]["status"], "ok")
         self.assertEqual(report["gold"]["latest_parse_date"], None)
+        self.assertEqual(report["alerts"], [])
+
+
+class DeadlineTest(MonitorTestBase):
+    """Issue #48: 締め時刻を過ぎた日だけを点検する。
+
+    11-18 06:15 JST の監視実行で、取得・コードリスト・Gold の判定が
+    前々日・前日分へずれずに誤警報になった実例の回帰テストである。
+    """
+
+    def test_early_run_checks_previous_dates_without_false_alarms(self):
+        # 06:15 の実行では、取得は 11-16、コードリストは 11-16、
+        # 解析は 11-17、Gold は 11-16 を点検する。
+        self.put_acquisition_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-16")
+        self.put("gold/summary.json", _json_bytes({
+            "generated_at": "2026-11-16T12:00:00+00:00",
+            "snapshot_date": "2026-11-16",
+            "annual_rows": 85191, "quarterly_rows": 122682,
+            "dividend_rows": 81047, "companies": 5261}))
+        report = self.run_monitor("2026-11-18",
+                                  now=self.at("2026-11-18", 6, 15))
+        self.assertEqual(report["acquisition"]["target_date"], "2026-11-16")
+        self.assertEqual(report["codelist"]["date"], "2026-11-16")
+        self.assertEqual(report["parse"]["date"], "2026-11-17")
+        self.assertEqual(report["gold"]["date"], "2026-11-16")
+        self.assertEqual(report["alerts"], [])
+
+    def test_acquisition_deadline_boundary(self):
+        # 取得の締めは対象日+1 の 15:30 + 10時間 = 01:30 (対象日+2)。
+        report = self.run_monitor("2026-11-18",
+                                  now=self.at("2026-11-18", 1, 29))
+        self.assertEqual(report["acquisition"]["target_date"], "2026-11-15")
+        report = self.run_monitor("2026-11-18",
+                                  now=self.at("2026-11-18", 1, 30))
+        self.assertEqual(report["acquisition"]["target_date"], "2026-11-16")
+
+    def test_codelist_deadline_boundary(self):
+        # コードリストの締めは当日の 23:00 + 10時間 = 翌 09:00。
+        report = self.run_monitor("2026-11-18",
+                                  now=self.at("2026-11-18", 8, 59))
+        self.assertEqual(report["codelist"]["date"], "2026-11-16")
+        report = self.run_monitor("2026-11-18",
+                                  now=self.at("2026-11-18", 9, 0))
+        self.assertEqual(report["codelist"]["date"], "2026-11-17")
+
+    def test_parse_deadline_boundary(self):
+        # 解析の締めは当日の 05:30 + 10時間 = 当日 15:30。
+        report = self.run_monitor("2026-11-18",
+                                  now=self.at("2026-11-18", 15, 29))
+        self.assertEqual(report["parse"]["date"], "2026-11-17")
+        report = self.run_monitor("2026-11-18",
+                                  now=self.at("2026-11-18", 15, 30))
+        self.assertEqual(report["parse"]["date"], "2026-11-18")
+
+    def test_gold_deadline_boundary(self):
+        # Gold の締めは当日の 20:30 + 10時間 = 翌 06:30。
+        report = self.run_monitor("2026-11-18",
+                                  now=self.at("2026-11-18", 6, 29))
+        self.assertEqual(report["gold"]["date"], "2026-11-16")
+        report = self.run_monitor("2026-11-18",
+                                  now=self.at("2026-11-18", 6, 30))
+        self.assertEqual(report["gold"]["date"], "2026-11-17")
+
+    def test_very_early_run_checks_older_due_dates(self):
+        # 00:30 の実行では、締めを過ぎていない 11-16・11-17 分は判定
+        # せず、締めを過ぎた古い日 (取得 11-14、コードリスト 11-15、
+        # 解析 11-16、Gold 11-15) を点検する。
+        self.put_acquisition_ok("2026-11-14")
+        self.put_codelist_ok("2026-11-15")
+        self.put("gold/summary.json", _json_bytes({
+            "generated_at": "2026-11-15T12:00:00+00:00",
+            "snapshot_date": "2026-11-15",
+            "annual_rows": 85191, "quarterly_rows": 122682,
+            "dividend_rows": 81047, "companies": 5261}))
+        report = self.run_monitor("2026-11-17",
+                                  now=self.at("2026-11-17", 0, 30))
+        self.assertEqual(report["acquisition"]["target_date"], "2026-11-14")
+        self.assertEqual(report["codelist"]["date"], "2026-11-15")
+        self.assertEqual(report["parse"]["date"], "2026-11-16")
+        self.assertEqual(report["gold"]["date"], "2026-11-15")
         self.assertEqual(report["alerts"], [])
 
 

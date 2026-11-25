@@ -295,18 +295,118 @@ class RunSnapshotTest(unittest.TestCase):
         self.assertEqual(by_code["E00002"]["change"], "removed")
         self.assertEqual(by_code["E00003"]["change"], "added")
 
-    def test_conflict_keeps_first(self):
+    def test_replaced_overwrites_with_last(self):
+        # Issue #48: 同日・異内容の取得では、その日の最後に成功した
+        # 取得を正として上書きする (従来の「先行分を保持」は廃止)。
         run_snapshot(self.work_dir("w1"), fetcher=lambda: sample_zip())
         first_csv = self.remote["codelist/date=2026-11-17/EdinetcodeDlInfo.csv"]
         other = sample_zip(rows=[make_row("E00009", name="別株式会社")])
+        other_csv = parse_codelist_zip(other)["csv_bytes"]
         summary = run_snapshot(self.work_dir("w2"), fetcher=lambda: other)
-        self.assertEqual(summary["status"], "conflict")
+        self.assertEqual(summary["status"], "replaced")
         self.assertEqual(
+            self.remote["codelist/date=2026-11-17/EdinetcodeDlInfo.csv"],
+            other_csv)
+        self.assertNotEqual(
             self.remote["codelist/date=2026-11-17/EdinetcodeDlInfo.csv"],
             first_csv)
         ledger = read_ledger(self.remote)
-        self.assertEqual(ledger[-1]["status"], "conflict")
+        self.assertEqual(ledger[-1]["status"], "replaced")
         self.assertIn("existing_sha256_csv", ledger[-1])
+        meta = json.loads(
+            self.remote["codelist/date=2026-11-17/snapshot.json"]
+            .decode("utf-8"))
+        self.assertEqual(meta["replaced_from_sha256"],
+                         ledger[-1]["existing_sha256_csv"])
+        # 差分は新しい版で再生成される。
+        diff = json.loads(self.remote["codelist/date=2026-11-17/diff.json"]
+                          .decode("utf-8"))
+        self.assertEqual(diff["added"], 1)
+        self.assertEqual(diff["current_count"], 1)
+        self.assertEqual(diff["snapshot_sha256_csv"],
+                         ledger[-1]["sha256_csv"])
+
+    def test_replaced_then_same_run_is_idempotent(self):
+        run_snapshot(self.work_dir("w1"), fetcher=lambda: sample_zip())
+        other = sample_zip(rows=[make_row("E00009", name="別株式会社")])
+        run_snapshot(self.work_dir("w2"), fetcher=lambda: other)
+        summary = run_snapshot(self.work_dir("w3"), fetcher=lambda: other)
+        self.assertEqual(summary["status"], "already_present")
+        ledger = read_ledger(self.remote)
+        self.assertEqual([r["status"] for r in ledger],
+                         ["ok", "replaced", "already_present"])
+
+    def test_stale_diff_regenerated_and_uploaded_on_rerun(self):
+        # M-1: 差し替え時に差分の再生成が失敗して古い差分が残った
+        # 場合、次回の同一内容の実行で差分が新しい版へ更新される。
+        # 再生成して status を generated としながら古い差分を残す
+        # ことはしない。
+        run_snapshot(self.work_dir("w1"), fetcher=lambda: sample_zip())
+        other = sample_zip(rows=[make_row("E00009", name="別株式会社")])
+
+        def boom(*a, **k):
+            raise RuntimeError("injected diff failure")
+
+        with mock.patch.object(codelist, "compute_diff", boom):
+            summary = run_snapshot(self.work_dir("w2"),
+                                   fetcher=lambda: other)
+        self.assertEqual(summary["status"], "replaced")
+        self.assertEqual(summary["diff_status"], "pending")
+        base = "codelist/date=2026-11-17"
+        diff = json.loads(self.remote[f"{base}/diff.json"].decode("utf-8"))
+        self.assertEqual(diff["current_count"], 2)
+
+        summary = run_snapshot(self.work_dir("w3"), fetcher=lambda: other)
+        self.assertEqual(summary["status"], "already_present")
+        self.assertEqual(summary["diff_status"], "generated")
+        diff = json.loads(self.remote[f"{base}/diff.json"].decode("utf-8"))
+        meta = json.loads(self.remote[f"{base}/snapshot.json"]
+                          .decode("utf-8"))
+        self.assertEqual(diff["snapshot_sha256_csv"], meta["sha256_csv"])
+        self.assertEqual(diff["added"], 1)
+        self.assertEqual(diff["current_count"], 1)
+        ledger = read_ledger(self.remote)
+        self.assertEqual(ledger[-1]["diff_status"], "generated")
+
+    def test_corrupt_existing_diff_regenerated_and_uploaded(self):
+        # M-1: 既存の差分が読めない (壊れた JSON) 場合も、sha を検証
+        # できないため「そろっている」とは主張せず、再生成して
+        # 上書きする。
+        run_snapshot(self.work_dir("w1"), fetcher=lambda: sample_zip())
+        base = "codelist/date=2026-11-17"
+        self.remote[f"{base}/diff.json"] = b"not json"
+        summary = run_snapshot(self.work_dir("w2"),
+                               fetcher=lambda: sample_zip())
+        self.assertEqual(summary["status"], "already_present")
+        self.assertEqual(summary["diff_status"], "generated")
+        diff = json.loads(self.remote[f"{base}/diff.json"].decode("utf-8"))
+        meta = json.loads(self.remote[f"{base}/snapshot.json"]
+                          .decode("utf-8"))
+        self.assertEqual(diff["snapshot_sha256_csv"], meta["sha256_csv"])
+        self.assertEqual(diff["current_count"], 2)
+
+    def test_diff_download_failure_regenerates_and_uploads(self):
+        # M-1: 既存の差分を取得できない場合も、sha を検証できない
+        # ため再生成して上書きする (内容が同じなら冪等)。
+        run_snapshot(self.work_dir("w1"), fetcher=lambda: sample_zip())
+        base = "codelist/date=2026-11-17"
+        diff_path = f"{base}/diff.json"
+        orig_download = codelist._download_if_exists
+
+        def flaky(api, repo, path_in_repo, local_path):
+            if path_in_repo == diff_path:
+                return False
+            return orig_download(api, repo, path_in_repo, local_path)
+
+        with mock.patch.object(codelist, "_download_if_exists", flaky):
+            summary = run_snapshot(self.work_dir("w2"),
+                                   fetcher=lambda: sample_zip())
+        self.assertEqual(summary["status"], "already_present")
+        self.assertEqual(summary["diff_status"], "generated")
+        diff = json.loads(self.remote[diff_path].decode("utf-8"))
+        meta = json.loads(self.remote[f"{base}/snapshot.json"]
+                          .decode("utf-8"))
+        self.assertEqual(diff["snapshot_sha256_csv"], meta["sha256_csv"])
 
     def test_fetch_failure_recorded(self):
         def boom():
