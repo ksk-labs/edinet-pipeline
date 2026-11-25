@@ -450,12 +450,17 @@ def _complete_diff(api, repo, work_dir, snap, summary, paths, remote,
     ショットと異なれば再生成する (差し替え時に差分の再生成が失敗
     して古い差分が残った場合の補完)。force が真の場合は、既存の
     有無にかかわらず再生成して上書きする (差し替え時の再生成用)。
+    再生成した差分は、既存の差分が古い版だった場合 (stale) も含めて
+    上書きする。再生成して status を generated としながら古い差分を
+    残すことはしない (M-1)。既存の差分が読めない場合も sha を検証
+    できないため同じ扱いとする (内容が同じなら再送は冪等である)。
     """
     date = snap["declared_date"]
     stage_dir = os.path.join(work_dir, "stage")
     result = {"status": "present", "base_date": None, "added": None,
               "removed": None, "changed": None, "completed": []}
-    if not force and paths["diff"] in remote and paths["changes"] in remote:
+    stale = False
+    if not force and paths["diff"] in remote:
         existing = os.path.join(stage_dir, "existing-diff.json")
         if _download_if_exists(api, repo, paths["diff"], existing):
             try:
@@ -463,11 +468,14 @@ def _complete_diff(api, repo, work_dir, snap, summary, paths, remote,
                     old_diff = json.load(f)
                 if old_diff.get("snapshot_sha256_csv") \
                         == summary["sha256_csv"]:
-                    return result
+                    if paths["changes"] in remote:
+                        return result
+                else:
+                    stale = True
             except (ValueError, OSError):
-                pass
+                stale = True
         else:
-            return result
+            stale = True
     try:
         base_date, base_by_code = _previous_snapshot(
             api, repo, remote, date, work_dir)
@@ -494,7 +502,7 @@ def _complete_diff(api, repo, work_dir, snap, summary, paths, remote,
              f"codelist {date}: diff changes"),
         ]
         for repo_path, data, message in products:
-            if repo_path in remote and not force:
+            if repo_path in remote and not (force or stale):
                 continue
             local = os.path.join(stage_dir, repo_path)
             _write_local(local, data)

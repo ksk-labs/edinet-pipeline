@@ -255,28 +255,45 @@ def _latest_snapshot_date(remote):
     return max(dates) if dates else None
 
 
-def _judge_company_master(summary, latest_snapshot_date):
+def _judge_company_master(summary, latest_snapshot_date,
+                          latest_snapshot_sha=None):
     """会社マスタの状態を判定する。戻り値は報告用の dict。
 
     master/summary.json が無い場合は missing とし、警報にはしない
     (警報の対象は仕様 §5 の取得・コードリスト・解析であり、会社
     マスタの有無は本節と件数信号で可視化する)。summary があり、
     適用済みスナップショットが最新のスナップショットに追いついて
-    いない場合は stale とし、日次配線の停止を警報にする。
+    いない場合は stale とし、日次配線の停止を警報にする。追いついて
+    いるかは日付だけでなく sha でも比べる (S-1): 同日差し替え後に
+    master update が失敗すると日付は同じままになるため、日付だけでは
+    気づけない。どちらかの sha が無ければ (移行前の summary など)
+    日付だけの比較に落とす。
     """
     if summary is None:
         return {"status": "missing", "companies": None,
                 "last_applied_snapshot_date": None,
                 "latest_snapshot_date": latest_snapshot_date,
+                "last_applied_snapshot_sha256": None,
+                "latest_snapshot_sha256": latest_snapshot_sha,
                 "last_submissions_rows": None}
     applied = summary.get("last_applied_snapshot_date")
-    stale = (latest_snapshot_date is not None
-             and (applied is None or applied < latest_snapshot_date))
+    applied_sha = summary.get("last_applied_snapshot_sha256")
+    stale = False
+    if latest_snapshot_date is not None:
+        if applied is None or applied < latest_snapshot_date:
+            stale = True
+        elif applied == latest_snapshot_date \
+                and applied_sha is not None \
+                and latest_snapshot_sha is not None \
+                and applied_sha != latest_snapshot_sha:
+            stale = True
     return {
         "status": "stale" if stale else "ok",
         "companies": summary.get("companies"),
         "last_applied_snapshot_date": applied,
         "latest_snapshot_date": latest_snapshot_date,
+        "last_applied_snapshot_sha256": applied_sha,
+        "latest_snapshot_sha256": latest_snapshot_sha,
         "last_submissions_rows": summary.get("last_submissions_rows"),
     }
 
@@ -463,8 +480,16 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO, now=None):
 
     master_summary = _load_json(api, repo, remote, "master/summary.json",
                                  work_dir, "master-summary.json")
-    master_report = _judge_company_master(master_summary,
-                                          _latest_snapshot_date(remote))
+    latest_snapshot_date = _latest_snapshot_date(remote)
+    latest_snapshot = None
+    if latest_snapshot_date is not None:
+        latest_snapshot = _load_json(
+            api, repo, remote,
+            f"codelist/date={latest_snapshot_date}/snapshot.json",
+            work_dir, "codelist-latest-snapshot.json")
+    master_report = _judge_company_master(
+        master_summary, latest_snapshot_date,
+        latest_snapshot.get("sha256_csv") if latest_snapshot else None)
 
     gold_summary = _load_json(api, repo, remote, "gold/summary.json",
                               work_dir, "gold-summary.json")
@@ -557,6 +582,10 @@ def run_monitor(run_date, work_dir, repo=DEFAULT_REPO, now=None):
             "last_applied_snapshot_date":
                 master_report["last_applied_snapshot_date"],
             "latest_snapshot_date": master_report["latest_snapshot_date"],
+            "last_applied_snapshot_sha256":
+                master_report["last_applied_snapshot_sha256"],
+            "latest_snapshot_sha256":
+                master_report["latest_snapshot_sha256"],
         })
     if gold_report["status"] == "stale":
         alerts.append({

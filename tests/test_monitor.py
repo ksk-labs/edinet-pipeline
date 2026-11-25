@@ -111,9 +111,12 @@ class MonitorTestBase(unittest.TestCase):
                 "finished_at": f"{target_date}T19:00:00+00:00",
             }))
 
-    def put_codelist_ok(self, run_date, row_count=11468):
-        self.put(f"codelist/date={run_date}/snapshot.json", _json_bytes({
-            "date": run_date, "row_count": row_count}))
+    def put_codelist_ok(self, run_date, row_count=11468, sha256_csv=None):
+        snapshot = {"date": run_date, "row_count": row_count}
+        if sha256_csv is not None:
+            snapshot["sha256_csv"] = sha256_csv
+        self.put(f"codelist/date={run_date}/snapshot.json",
+                 _json_bytes(snapshot))
         self.put("codelist/ledger.jsonl", _jsonl_bytes([
             {"date": run_date, "run_date": run_date, "status": "ok",
              "diff_status": "generated", "row_count": row_count},
@@ -401,11 +404,15 @@ class ParseIssuesTest(MonitorTestBase):
 class CompanyMasterMonitorTest(MonitorTestBase):
     """Issue #41: 会社マスタの件数信号と、未適用の警報。"""
 
-    def put_master(self, applied, companies=11823, last_sub_rows=50000):
-        self.put("master/summary.json", _json_bytes({
+    def put_master(self, applied, companies=11823, last_sub_rows=50000,
+                   applied_sha=None):
+        summary = {
             "last_applied_snapshot_date": applied,
             "companies": companies,
-            "last_submissions_rows": last_sub_rows}))
+            "last_submissions_rows": last_sub_rows}
+        if applied_sha is not None:
+            summary["last_applied_snapshot_sha256"] = applied_sha
+        self.put("master/summary.json", _json_bytes(summary))
 
     def test_current_master_is_ok_and_signals_present(self):
         self.put_acquisition_ok("2026-11-15")
@@ -443,6 +450,43 @@ class CompanyMasterMonitorTest(MonitorTestBase):
         self.assertIsNone(report["signals"]["master_companies"])
         self.assertIsNone(
             report["signals"]["master_last_submissions_rows"])
+        self.assertEqual(report["alerts"], [])
+
+    def test_same_date_different_sha_is_stale(self):
+        # S-1: 同日差し替え後に master update が失敗した場合、日付は
+        # 同じままになるため、sha の比較で stale とする。
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17", sha256_csv="bbb")
+        self.put_master("2026-11-17", applied_sha="aaa")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["company_master"]["status"], "stale")
+        kinds = [a["kind"] for a in report["alerts"]]
+        self.assertEqual(kinds, ["company_master_stale"])
+        alert = report["alerts"][0]
+        self.assertEqual(alert["last_applied_snapshot_sha256"], "aaa")
+        self.assertEqual(alert["latest_snapshot_sha256"], "bbb")
+        self.assertIn("company_master_stale",
+                      self.saved_state()["open_alerts"])
+
+    def test_same_date_same_sha_is_ok(self):
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17", sha256_csv="bbb")
+        self.put_master("2026-11-17", applied_sha="bbb")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["company_master"]["status"], "ok")
+        self.assertEqual(report["alerts"], [])
+
+    def test_same_date_missing_sha_falls_back_to_date(self):
+        # 移行前の summary (sha 無し) では日付だけの比較に落とし、
+        # 誤った stale を出さない。
+        self.put_acquisition_ok("2026-11-15")
+        self.put_codelist_ok("2026-11-16")
+        self.put_codelist_ok("2026-11-17", sha256_csv="bbb")
+        self.put_master("2026-11-17")
+        report = self.run_monitor("2026-11-17")
+        self.assertEqual(report["company_master"]["status"], "ok")
         self.assertEqual(report["alerts"], [])
 
 

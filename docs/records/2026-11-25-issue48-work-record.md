@@ -16,7 +16,7 @@
 - コードリスト（日付 D、実行 09:15/15:15/19:00/23:00 JST on D）: 締め = 23:00 + 10時間 = D+1 の 09:00 JST。
 - 解析の滞留（実行 05:30 JST on D）: 締め = 05:30 + 10時間 = 当日 15:30 JST。
 - Gold（生成 20:30 JST on D）: 締め = 20:30 + 10時間 = D+1 の 06:30 JST。
-- 会社マスタは判定を変更しない（後述 §1.4）。
+- 会社マスタは日付に加えて sha でも判定する（後述 §1.4。code-review の S-1 による修正）。
 
 ### 1.2 点検日の決め方（判定の保留に代わる「締めを過ぎた最新の日を点検する」方式）
 
@@ -41,7 +41,7 @@
 - 再適用の安全性: `_observe` は同値なら最終観測日と観測回数を伸ばすだけであり、値が変わった場合は新しい行を開く（旧行は閉じたまま残る）。同じ日付の再適用は、観測回数が1増える（再観測として数える）ほかは既存の履歴を壊さない。分類の `snapshot_count` も同じく1増える。再適用は差し替えられた日付にだけ起きる。
 - 最終適用日より前の日付の差し替えは再適用しない（`apply_snapshot` は最終状態を前提としており、古い日付の再適用は `in_latest_snapshot` などを壊す）。実測上あり得ない：差し替えは当日のファイルにしか起きず、実行遅延の実測最大は約10時間で、24時間を超える遅延は観測されていない。残余リスクとしてここに記録する。
 - 移行時の1回だけの再適用: 既存の state には `applied_snapshot_sha256` が無いため、初回の更新では最終適用日を（現在の sha で）再適用する。これは1回だけのもので、観測回数が1増えるほか影響はない。
-- 監視の会社マスタ判定は変更しない。理由：マスタ更新は codelist ジョブの後段（needs）で直列化されており、スナップショットが存在すれば同 run 内で適用されるため、監視の早朝実行で「適用済み < 最新」が誤って出る構造ではない。適用の遅れが起きた場合は真の遅れであり、警報が正しい。
+- 監視の会社マスタ判定は、日付に加えて sha も比べる（code-review の S-1 による修正。2026-11-25 07:4x）。同日差し替え後に master update が失敗すると適用済み日付と最新日付は同じままになるため、日付だけでは気づけない。比較は master/summary.json の `last_applied_snapshot_sha256` と、最新スナップショットの snapshot.json の `sha256_csv` で行う。どちらかの sha が無ければ（移行前の summary など）日付だけの比較に落とし、誤った stale は出さない。監視の早朝実行で「適用済み < 最新」が誤って出る構造ではない点は従来どおり（マスタ更新は codelist ジョブの後段で直列化されているため）。
 
 ### 1.5 取得スケジュールの追加（夕方・深夜の回）
 
@@ -69,12 +69,12 @@ daily_codelist.yml に 19:00 JST と 23:00 JST の実行を追加する。昼の
 
 ## 2. 変更範囲
 
-- `pipeline/monitor.py`: 締め時刻による点検日の決定、codelist_conflict 警報の廃止（replaced を情報として報告）、連続失敗の加算条件の修正、報告への点検日の記録。
-- `pipeline/codelist.py`: 同日・異内容を "replaced" とし、スナップショット一式の上書きと差分の再生成。`_complete_diff` に強制再生成を追加。
+- `pipeline/monitor.py`: 締め時刻による点検日の決定、codelist_conflict 警報の廃止（replaced を情報として報告）、連続失敗の加算条件の修正、報告への点検日の記録。**S-1 の修正（2026-11-25 07:4x）**: `_judge_company_master` で日付に加えて sha でも stale を判定する。`run_monitor` で最新スナップショットの sha を読んで渡す。報告と警報に sha を載せる。
+- `pipeline/codelist.py`: 同日・異内容を "replaced" とし、スナップショット一式の上書きと差分の再生成。`_complete_diff` に強制再生成を追加。**M-1 の修正（2026-11-25 07:4x）**: 既存の差分が古い版の場合に stale として再生成して上書きする。既存の差分が読めない・取得できない場合も同じ扱いとする。
 - `pipeline/company_master.py`: スナップショットへの sha256 の追加、最終適用日の再適用、summary への適用 sha の追加。`apply_new_snapshots` は (日付, 行, sha256) の3要素に加え、sha の無い (日付, 行) の2要素（テストやローカル検証用）も受け付け、その場合は従来どおり最終適用日以前を読み飛ばす。
 - `.github/workflows/daily_codelist.yml`: 19:00・23:00 JST の実行を追加。
 - `.github/workflows/daily_monitor.yml`: コメントの更新（点検対象の日の決め方）。
-- `tests/test_monitor.py`、`tests/test_codelist.py`、`tests/test_company_master.py`: 新しい挙動のテストと、変わった意味への既存テストの更新。
+- `tests/test_monitor.py`、`tests/test_codelist.py`、`tests/test_company_master.py`: 新しい挙動のテストと、変わった意味への既存テストの更新。**M-1 のテスト3件、S-1 のテスト3件を追加（2026-11-25 07:4x）**。詳細は §3.3 を参照。
 - `docs/records/2026-11-25-issue48-work-record.md`: 本記録。
 
 ## 3. テスト結果
@@ -104,9 +104,29 @@ daily_codelist.yml に 19:00 JST と 23:00 JST の実行を追加する。昼の
 
 突然変異の確認（exec 回復後に実施）: 締め時刻の定数（`SCHEDULER_DELAY_ALLOWANCE` の 10時間、各工程の最終実行時刻）をずらすと `DeadlineTest` の境界テストが落ちること、"replaced" の判定を外すと `CodelistMissingTest` の新テストが落ちること、`apply_new_snapshots` の再適用条件を外すと `ReapplySnapshotTest` が落ちること、をそれぞれ確認する。
 
+### 3.3 code-review の指摘 M-1・S-1 の修正（2026-11-25 07:4x）
+
+レビュー報告書は `~/workspace/goals/edinet/hidden_files/issue48-review/issue48-code-review.md`。判定は「修正が必要」（must-fix 1件・should-fix 1件・note 8件）。note（N-1〜N-8）のうち対応が要るものはない。
+
+**M-1（`pipeline/codelist.py` の `_complete_diff`）**: 既存 diff.json の sha が現在のスナップショットと異なる場合、再生成へ進むものの products ループの `if repo_path in remote and not force: continue` により両ファイルともアップロードがスキップされ、戻り値は status="generated" になるがリモートの diff.json は古い版のまま残っていた。修正は、不一致を検出した時点でローカルに `stale` フラグを立て、ガードを `not (force or stale)` とした。あわせて、既存の差分が読めない場合（JSON の破損）と取得できない場合（ダウンロード失敗）も、sha を検証できないため同じ扱い（stale として再生成して上書き）とした。内容が同じなら再送は冪等である。なお、既存の差分が無く changes.jsonl だけが残っている場合など、従来の補完経路（不足した成果物だけを上げる）の挙動は変えていない（sha が一致する差分は再送しない）。
+
+**S-1（`pipeline/monitor.py` の `_judge_company_master`）**: 会社マスタの stale 判定を、日付だけでなく sha でも比べるようにした。比較は master/summary.json の `last_applied_snapshot_sha256` と、最新スナップショットの snapshot.json の `sha256_csv` で行う。`run_monitor` で最新スナップショットの snapshot.json を読んで sha を渡す。どちらかの sha が無ければ（移行前の summary など）日付だけの比較に落とし、誤った stale は出さない。報告の company_master と stale の警報に、両方の sha を載せた。
+
+**追加したテスト**:
+- `tests/test_codelist.py`（M-1 の経路3件）: `test_stale_diff_regenerated_and_uploaded_on_rerun`（差し替え時に差分の再生成が失敗して古い差分が残り、次回の同一内容の実行で新しい版へ更新されること）、`test_corrupt_existing_diff_regenerated_and_uploaded`（既存の差分が壊れた JSON の場合も再生成して上書きすること）、`test_diff_download_failure_regenerates_and_uploads`（既存の差分を取得できない場合も再生成して上書きすること）。
+- `tests/test_monitor.py`（S-1 の経路3件）: `test_same_date_different_sha_is_stale`（同日・異 sha で stale になり `company_master_stale` の警報が出ること）、`test_same_date_same_sha_is_ok`（同日・同 sha で ok になること）、`test_same_date_missing_sha_falls_back_to_date`（移行前の summary（sha 無し）では日付だけの比較に落とし、誤った stale を出さないこと）。fixture の `put_codelist_ok` と `put_master` に sha を渡せる引数を追加した（既存の呼び出しは変更なし）。
+
+**検証の状況（未了）**: exec 基盤障害（`failed to prepare tool cgroup: no pure cgroup-v2 base resolved`）のため、本タスク中は exec が一度も起動せず、再現スクリプトの修正前後の実行と全スイートの再実行ができていない。修正を先に適用したため、修正前の再現確認は検証スクリプトで修正前の状態へ一時的に戻して行う。exec 回復後の再開手順は次のとおり（1コマンドで修正前後の確認と全スイートを実行する）:
+
+```
+~/workspace/goals/edinet/hidden_files/t3/venv/bin/python ~/workspace/goals/edinet/hidden_files/issue48-review/verify_m1_before_after.py
+```
+
+検証スクリプト（`~/workspace/goals/edinet/hidden_files/issue48-review/verify_m1_before_after.py`）は次の順で確認する。(1) codelist.py を修正前の状態へ一時的に戻し、再現スクリプトで BUG REPRODUCED が出ることと、M-1 テスト3件が失敗すること。(2) 修正後の状態へ戻し、再現スクリプトで diff.json UPDATED が出ることと、M-1・S-1 テスト6件が合格すること。(3) 全スイート（381件＋追加6件＝387件）の実行。いずれかが期待どおりでなければ終了コード 1 で止まる。ファイルは常に修正後の状態へ戻す（finally で復元）。途中で止まった場合は `issue48-review/codelist.py.after-m1-fix` が修正後の実物であり、repo の `pipeline/codelist.py` へ上書きすれば復旧できる。
+
 ## 4. 残件・未決
 
-- **テストの実行は完了（2026-11-25 07:1x）**: §3.1 のとおり全スイート 381件が合格。初回実行の 28件の失敗は §3.2 の修正で解消済み。**突然変異の確認は本タスクの範囲外**とし、後続の独立検証が担う。実施役（implementer）では行わない。
+- **M-1・S-1 の修正は完了、検証は exec 障害のため未了（2026-11-25 07:4x）**: §3.3 のとおり。検証スクリプトの実行結果を §3.3 へ追記すること。**突然変異の確認は本タスクの範囲外**とし、後続の独立検証が担う。実施役（implementer）では行わない。
 - **ブランチ作成・コミット・push・PR 作成（exec 回復後に実施）**: ブランチ名は `issue48-monitor-fix` とする。コミットメッセージは `fix: Issue #48 の監視の誤警報を是正する`（型プレフィックス＋要約72文字以内・末尾句点なし）に Executor トレーラ `Executor: implementer` を付ける。push は gh_api.py 経由で blob→tree→commit→ref 更新の手順で行い、プッシュ直前にリモート head（main `14c9bdc33a39a688ababac6deed32a062422b7f4`）を取得し直して想定値と一致することを確認する。PR 本文は必須3節「目的」「変更範囲」「完了条件」＋「- フロー分岐: コード・1セッション級」＋「チケット: #48」。**マージと Issue #48 のクローズは実施役では行わず、メインが行う**。
 - `_latest_due_date` の None 返却（pending 扱い）は、締めの計算上は実用上起きない（`_latest_due_date` の docstring に明記）。`run_monitor` の pending 分岐と各 `_judge_*` の None 対応は防御的な経路として残してある。
 - monitor の `last_checked_target` が文字列でない値の場合に TypeError で落ちる件（塊4 の独立検証の観察）は、本チケットの範囲外の未決として残る。
