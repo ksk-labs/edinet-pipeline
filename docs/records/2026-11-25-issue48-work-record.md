@@ -124,10 +124,12 @@ daily_codelist.yml に 19:00 JST と 23:00 JST の実行を追加する。昼の
 
 検証スクリプト（`~/workspace/goals/edinet/hidden_files/issue48-review/verify_m1_before_after.py`）は次の順で確認する。(1) codelist.py を修正前の状態へ一時的に戻し、再現スクリプトで BUG REPRODUCED が出ることと、M-1 テスト3件が失敗すること。(2) 修正後の状態へ戻し、再現スクリプトで diff.json UPDATED が出ることと、M-1・S-1 テスト6件が合格すること。(3) 全スイート（381件＋追加6件＝387件）の実行。いずれかが期待どおりでなければ終了コード 1 で止まる。ファイルは常に修正後の状態へ戻す（finally で復元）。途中で止まった場合は `issue48-review/codelist.py.after-m1-fix` が修正後の実物であり、repo の `pipeline/codelist.py` へ上書きすれば復旧できる。
 
+**検証の結果（完了、2026-11-25 12:41 JST）**: exec 回復後にメインが検証スクリプトを実行し、全項目が期待どおりだった。修正前は再現スクリプトが BUG REPRODUCED を示し M-1 テスト3件が失敗（failures=2・errors=1）し、修正後は diff.json が新しい sha へ更新され、M-1・S-1 テスト6件が合格し、全スイート 387件が合格した（Ran 387 tests、OK）。独立検証役も同じスクリプトを再実行して全項目合格を確認した（報告書 `~/workspace/goals/edinet/hidden_files/issue48-review/issue48-fixes-verification.md`）。検証スクリプトの REPO パスに誤り（`issue48/` の抜け）があったため、初回はメインが1行修正してから実行した。
+
 ## 4. 残件・未決
 
-- **M-1・S-1 の修正は完了、検証は exec 障害のため未了（2026-11-25 07:4x）**: §3.3 のとおり。検証スクリプトの実行結果を §3.3 へ追記すること。**突然変異の確認は本タスクの範囲外**とし、後続の独立検証が担う。実施役（implementer）では行わない。
-- **ブランチ作成・コミット・push・PR 作成（exec 回復後に実施）**: ブランチ名は `issue48-monitor-fix` とする。コミットメッセージは `fix: Issue #48 の監視の誤警報を是正する`（型プレフィックス＋要約72文字以内・末尾句点なし）に Executor トレーラ `Executor: implementer` を付ける。push は gh_api.py 経由で blob→tree→commit→ref 更新の手順で行い、プッシュ直前にリモート head（main `14c9bdc33a39a688ababac6deed32a062422b7f4`）を取得し直して想定値と一致することを確認する。PR 本文は必須3節「目的」「変更範囲」「完了条件」＋「- フロー分岐: コード・1セッション級」＋「チケット: #48」。**マージと Issue #48 のクローズは実施役では行わず、メインが行う**。
+- **M-1・S-1 の修正と検証は完了（2026-11-25 12:41 JST）**: §3.3 のとおり。メインと独立検証役の両方が検証スクリプトを実行し、全スイート 387件の合格まで確認済み。突然変異の確認に相当する確認（修正前の状態で M-1 が再現しテストが失敗すること）は検証スクリプトの手順 (1) で実施済み。
+- **ブランチ・コミット・PR は作成済み（2026-11-25）**: ブランチ `issue48-monitor-fix`、初回コミット 22bb9b26a4036a5a897c786404f290c1c1d508bf（Executor: implementer）、PR #66 を作成済み。M-1・S-1 の修正コミット 77d36ec9b82f52f6bdf5906820550cb1964fbf5a（Executor: fixer）も push 済み。**マージと Issue #48 のクローズはメインが行う**。
 - `_latest_due_date` の None 返却（pending 扱い）は、締めの計算上は実用上起きない（`_latest_due_date` の docstring に明記）。`run_monitor` の pending 分岐と各 `_judge_*` の None 対応は防御的な経路として残してある。
 - monitor の `last_checked_target` が文字列でない値の場合に TypeError で落ちる件（塊4 の独立検証の観察）は、本チケットの範囲外の未決として残る。
 - 夜間の取得がその日すべて失敗・遅延した場合の残余リスク（§1.5 参照）は仕様の精緻化した形のとおり残る。
